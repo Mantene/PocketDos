@@ -45,6 +45,29 @@
       emulators.pathSuffix = "";
     }
 
+    // iOS starts every Web Audio context suspended until a user gesture, and
+    // js-dos creates its context after the launch tap has expired. Wrap the
+    // AudioContext constructor so we can resume js-dos's context(s) on the first
+    // touch/keypress inside the game.
+    (function () {
+      const Orig = window.AudioContext || window.webkitAudioContext;
+      if (!Orig) return;
+      const contexts = [];
+      function Patched(...args) {
+        const ctx = new Orig(...args);
+        contexts.push(ctx);
+        return ctx;
+      }
+      Patched.prototype = Orig.prototype;
+      window.AudioContext = Patched;
+      if (window.webkitAudioContext) window.webkitAudioContext = Patched;
+      const resumeAll = () => contexts.forEach((c) => {
+        if (c.state === "suspended" && c.resume) c.resume().catch(() => {});
+      });
+      ["touchend", "pointerup", "mousedown", "keydown"].forEach((evt) =>
+        window.addEventListener(evt, resumeAll, true));
+    })();
+
     // Turn a raw game .zip into a runnable js-dos bundle on the fly:
     // extract it into a default bundle (which mounts C: and drops to the DOS
     // prompt) and hand js-dos a blob URL. .jsdos files load unchanged.

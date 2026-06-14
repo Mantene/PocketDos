@@ -1,10 +1,16 @@
 import SwiftUI
+import AVFoundation
 
-// PocketDOS — Track A spike.
-// Goal: prove that js-dos (WASM DOSBox/-X) runs inside a WKWebView served entirely
-// from the app bundle (offline), so we can measure real Win9x / DOS speed on device.
 @main
 struct PocketDOSApp: App {
+    init() {
+        // Play game audio through the speaker even when the ring/silent switch is
+        // on (default WKWebView audio is "ambient" and gets muted otherwise).
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default, options: [])
+        try? session.setActive(true)
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
