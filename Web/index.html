@@ -45,15 +45,44 @@
       emulators.pathSuffix = "";
     }
 
-    // Audio: capture js-dos's AudioContext(s), resume them on gesture, fall back
-    // if iOS rejects the requested sample rate, and log diagnostics ([audio] ...)
-    // so we can see exactly where sound dies (creation / resume / frame output).
+    // Audio: a WKWebView's WebContent process has its OWN AVAudioSession that
+    // defaults to "ambient" (Silent-switch-muted, doesn't assert the speaker) —
+    // which the host app's AVAudioSession.playback does NOT change. Flip the page's
+    // session to "playback" (iOS 17+ navigator.audioSession) so sound plays
+    // regardless of the Silent switch; resume on gesture; recover "interrupted".
     (function () {
       const Orig = window.AudioContext || window.webkitAudioContext;
       if (!Orig) { console.warn("[audio] no AudioContext in this WebView"); return; }
       const contexts = [];
 
+      function assertPlaybackSession() {
+        try {
+          if (navigator.audioSession && navigator.audioSession.type !== "playback") {
+            navigator.audioSession.type = "playback";
+            console.log("[audio] navigator.audioSession.type=playback");
+          }
+        } catch (e) { console.warn("[audio] audioSession.type set failed: " + e.message); }
+      }
+      assertPlaybackSession();
+
+      // The WebKit AudioContext can get stuck "interrupted"; resume() alone is
+      // unreliable, so suspend→(delay)→resume after re-asserting the session.
+      function recover(ctx) {
+        assertPlaybackSession();
+        if (!ctx || ctx.state === "running") return;
+        if (ctx.state === "suspended" || ctx.state === "interrupted") {
+          ctx.suspend().catch(() => {}).finally(() => {
+            setTimeout(() => {
+              ctx.resume && ctx.resume()
+                .then(() => console.log("[audio] recovered → " + ctx.state))
+                .catch((e) => console.error("[audio] recover failed: " + e.message));
+            }, 80);
+          });
+        }
+      }
+
       function Patched(...args) {
+        assertPlaybackSession();
         let ctx;
         try {
           ctx = new Orig(...args);
@@ -63,10 +92,12 @@
           ctx = new Orig();
         }
         contexts.push(ctx);
-        console.log("[audio] context created requested=" + JSON.stringify(args[0]) +
-                    " actualRate=" + ctx.sampleRate + " state=" + ctx.state);
+        console.log("[audio] context created rate=" + ctx.sampleRate + " state=" + ctx.state);
         if (ctx.addEventListener) {
-          ctx.addEventListener("statechange", () => console.log("[audio] state → " + ctx.state));
+          ctx.addEventListener("statechange", () => {
+            console.log("[audio] state → " + ctx.state);
+            if (ctx.state === "interrupted" || ctx.state === "suspended") recover(ctx);
+          });
         }
         return ctx;
       }
@@ -74,35 +105,22 @@
       window.AudioContext = Patched;
       if (window.webkitAudioContext) window.webkitAudioContext = Patched;
 
-      // One-time test tone to isolate the OUTPUT path: if you HEAR this beep on
-      // first tap, ctx→speaker works and any silence is js-dos not producing
-      // samples; if you DON'T hear it, the iOS routing/session is the problem.
-      let beeped = false;
-      const testBeep = (c) => {
-        if (beeped || !c) return;
-        beeped = true;
-        try {
-          const osc = c.createOscillator();
-          const g = c.createGain();
-          g.gain.value = 0.2;
-          osc.frequency.value = 660;
-          osc.connect(g); g.connect(c.destination);
-          osc.start();
-          osc.stop(c.currentTime + 0.25);
-          console.log("[audio] TEST BEEP played (ctx=" + c.state + " rate=" + c.sampleRate +
-                      ") — did you hear it?");
-        } catch (e) { console.error("[audio] beep failed: " + e.message); }
+      const resumeAll = () => {
+        assertPlaybackSession();
+        contexts.forEach((c) => {
+          if (c.resume && c.state === "suspended") {
+            c.resume().catch((e) => console.error("[audio] resume failed: " + e.message));
+          }
+        });
       };
-      const resumeAll = () => contexts.forEach((c) => {
-        if (c.resume && c.state === "suspended") {
-          c.resume().then(() => { console.log("[audio] resumed → " + c.state); testBeep(c); })
-                    .catch((e) => console.error("[audio] resume failed: " + e.message));
-        } else if (c.state === "running") {
-          testBeep(c);
-        }
-      });
       ["touchend", "pointerup", "pointerdown", "mousedown", "keydown"].forEach((evt) =>
         window.addEventListener(evt, resumeAll, true));
+
+      // Re-assert + recover when returning to the app / regaining focus.
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") { assertPlaybackSession(); contexts.forEach(recover); }
+      });
+      window.addEventListener("focus", () => { assertPlaybackSession(); contexts.forEach(recover); }, true);
 
       // Instrument the ScriptProcessor js-dos uses, to confirm frames are produced
       // and whether they carry actual (non-zero) audio.
