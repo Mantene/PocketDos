@@ -32,6 +32,9 @@ struct Game: Identifiable, Hashable {
     var executables: [String] = []
     /// Override for emulated RAM (DOSBox `memsize`, in MB); nil = use the bundle's own.
     var memoryMB: Int? = nil
+    /// Extra dosbox.conf lines appended at launch (e.g. "[sblaster]\nirq=5") to
+    /// override the bundle's config. nil/empty = no override.
+    var configOverride: String? = nil
 
     var isZip: Bool { bundleFileName.lowercased().hasSuffix(".zip") }
     /// A zip we haven't chosen a launch command for yet, with options to offer.
@@ -45,7 +48,7 @@ struct Game: Identifiable, Hashable {
 /// Writes meta.json for a game folder.
 func writeGameMeta(title: String, profile: ControlProfile,
                    runCommand: String?, executables: [String],
-                   memoryMB: Int?, to dir: URL) {
+                   memoryMB: Int?, configOverride: String?, to dir: URL) {
     var obj: [String: Any] = [
         "title": title,
         "controlProfile": profile.rawValue,
@@ -53,6 +56,7 @@ func writeGameMeta(title: String, profile: ControlProfile,
     ]
     if let runCommand { obj["runCommand"] = runCommand }
     if let memoryMB { obj["memoryMB"] = memoryMB }
+    if let configOverride, !configOverride.isEmpty { obj["configOverride"] = configOverride }
     if let data = try? JSONSerialization.data(withJSONObject: obj) {
         try? data.write(to: dir.appendingPathComponent("meta.json"))
     }
@@ -61,19 +65,41 @@ func writeGameMeta(title: String, profile: ControlProfile,
 /// Persists a new control profile (preserving the other fields).
 func writeControlProfile(_ profile: ControlProfile, for game: Game) {
     writeGameMeta(title: game.title, profile: profile, runCommand: game.runCommand,
-                  executables: game.executables, memoryMB: game.memoryMB, to: game.folderURL)
+                  executables: game.executables, memoryMB: game.memoryMB,
+                  configOverride: game.configOverride, to: game.folderURL)
 }
 
 /// Persists a new launch command (preserving the other fields).
 func writeRunCommand(_ runCommand: String?, for game: Game) {
     writeGameMeta(title: game.title, profile: game.controlProfile, runCommand: runCommand,
-                  executables: game.executables, memoryMB: game.memoryMB, to: game.folderURL)
+                  executables: game.executables, memoryMB: game.memoryMB,
+                  configOverride: game.configOverride, to: game.folderURL)
 }
 
 /// Persists an emulated-RAM override (preserving the other fields).
 func writeMemory(_ memoryMB: Int?, for game: Game) {
     writeGameMeta(title: game.title, profile: game.controlProfile, runCommand: game.runCommand,
-                  executables: game.executables, memoryMB: memoryMB, to: game.folderURL)
+                  executables: game.executables, memoryMB: memoryMB,
+                  configOverride: game.configOverride, to: game.folderURL)
+}
+
+/// Persists a dosbox.conf override (preserving the other fields).
+func writeConfigOverride(_ configOverride: String?, for game: Game) {
+    writeGameMeta(title: game.title, profile: game.controlProfile, runCommand: game.runCommand,
+                  executables: game.executables, memoryMB: game.memoryMB,
+                  configOverride: configOverride, to: game.folderURL)
+}
+
+/// Reads the dosbox.conf embedded in a .jsdos bundle (for showing current settings
+/// in the config editor). Returns nil for zip games (config is generated at launch).
+func currentDosboxConf(for game: Game) -> String? {
+    guard game.bundleFileName.lowercased().hasSuffix(".jsdos") else { return nil }
+    let bundleURL = game.folderURL.appendingPathComponent(game.bundleFileName)
+    guard let archive = try? Archive(url: bundleURL, accessMode: .read),
+          let entry = archive[".jsdos/dosbox.conf"] else { return nil }
+    var data = Data()
+    _ = try? archive.extract(entry) { data.append($0) }
+    return String(data: data, encoding: .utf8)
 }
 
 /// Lists executable entries (.exe/.com/.bat) inside a zip, for the launch picker.
@@ -142,6 +168,7 @@ final class GameStore: ObservableObject {
         var runCommand: String? = nil
         var executables: [String] = []
         var memoryMB: Int? = nil
+        var configOverride: String? = nil
         let meta = dir.appendingPathComponent("meta.json")
         if let data = try? Data(contentsOf: meta),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -150,12 +177,13 @@ final class GameStore: ObservableObject {
             if let rc = obj["runCommand"] as? String { runCommand = rc }
             if let exes = obj["executables"] as? [String] { executables = exes }
             if let mb = obj["memoryMB"] as? Int { memoryMB = mb }
+            if let co = obj["configOverride"] as? String { configOverride = co }
         }
 
         return Game(id: dir.lastPathComponent, title: title,
                     bundleFileName: bundle.lastPathComponent, folderURL: dir,
                     controlProfile: profile, runCommand: runCommand,
-                    executables: executables, memoryMB: memoryMB)
+                    executables: executables, memoryMB: memoryMB, configOverride: configOverride)
     }
 
     /// Copies a picked file into a fresh library folder.
@@ -175,14 +203,14 @@ final class GameStore: ObservableObject {
         let title = sourceURL.deletingPathExtension().lastPathComponent
         let exes = ext.lowercased() == "zip" ? executablesInZip(at: dest) : []
         writeGameMeta(title: title, profile: .fps, runCommand: nil,
-                      executables: exes, memoryMB: nil, to: dir)
+                      executables: exes, memoryMB: nil, configOverride: nil, to: dir)
         reload()
     }
 
     func rename(_ game: Game, to newTitle: String) {
         writeGameMeta(title: newTitle, profile: game.controlProfile,
                       runCommand: game.runCommand, executables: game.executables,
-                      memoryMB: game.memoryMB, to: game.folderURL)
+                      memoryMB: game.memoryMB, configOverride: game.configOverride, to: game.folderURL)
         reload()
     }
 
@@ -195,6 +223,13 @@ final class GameStore: ObservableObject {
     /// Sets the emulated-RAM override (nil = use the bundle's own memsize).
     func setMemory(_ memoryMB: Int?, for game: Game) {
         writeMemory(memoryMB, for: game)
+        reload()
+    }
+
+    /// Sets the dosbox.conf override appended at launch (nil/"" = none).
+    func setConfigOverride(_ text: String?, for game: Game) {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        writeConfigOverride((trimmed?.isEmpty ?? true) ? nil : trimmed, for: game)
         reload()
     }
 

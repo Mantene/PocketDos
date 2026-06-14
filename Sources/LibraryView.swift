@@ -1,12 +1,25 @@
 import SwiftUI
 
+/// Which modal sheet the library is presenting (single sheet avoids SwiftUI's
+/// multiple-.sheet conflicts).
+enum LibrarySheet: Identifiable {
+    case launchPicker(Game)
+    case config(Game)
+    var id: String {
+        switch self {
+        case .launchPicker(let g): return "p" + g.id
+        case .config(let g): return "c" + g.id
+        }
+    }
+}
+
 /// Root screen: a cover-art grid of imported games + an importer.
 struct LibraryView: View {
     @StateObject private var store = GameStore()
     @State private var importing = false
     @State private var importError: String?
     @State private var playingGame: Game?
-    @State private var setupGame: Game?
+    @State private var sheet: LibrarySheet?
 
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 16)]
 
@@ -28,7 +41,7 @@ struct LibraryView: View {
                                 .contextMenu {
                                     if game.isZip {
                                         Button {
-                                            setupGame = game
+                                            sheet = .launchPicker(game)
                                         } label: {
                                             Label("Set launch program", systemImage: "terminal")
                                         }
@@ -40,6 +53,11 @@ struct LibraryView: View {
                                         }
                                     } label: {
                                         Label("Emulated memory", systemImage: "memorychip")
+                                    }
+                                    Button {
+                                        sheet = .config(game)
+                                    } label: {
+                                        Label("DOS config…", systemImage: "slider.horizontal.3")
                                     }
                                     Button(role: .destructive) {
                                         store.delete(game)
@@ -66,12 +84,20 @@ struct LibraryView: View {
             .navigationDestination(item: $playingGame) { game in
                 EmulatorView(game: game)
             }
-            .sheet(item: $setupGame) { game in
-                LaunchPickerView(game: game) { choice in
-                    store.setRunCommand(choice, for: game)
-                    setupGame = nil
-                    // Launch with the freshly chosen command.
-                    playingGame = store.game(byId: game.id)
+            .sheet(item: $sheet) { which in
+                switch which {
+                case .launchPicker(let game):
+                    LaunchPickerView(game: game) { choice in
+                        store.setRunCommand(choice, for: game)
+                        sheet = nil
+                        // Launch with the freshly chosen command.
+                        playingGame = store.game(byId: game.id)
+                    }
+                case .config(let game):
+                    ConfigEditorView(game: game) { text in
+                        store.setConfigOverride(text, for: game)
+                        sheet = nil
+                    }
                 }
             }
             .fileImporter(isPresented: $importing,
@@ -113,7 +139,7 @@ struct LibraryView: View {
 
     private func launch(_ game: Game) {
         if game.needsLaunchSetup {
-            setupGame = game        // ask which program to run first
+            sheet = .launchPicker(game)   // ask which program to run first
         } else {
             playingGame = game
         }
@@ -173,6 +199,7 @@ struct EmulatorView: View {
         EmulatorWebView(gameRelativeURL: game.webRelativeURL,
                         runCommand: game.runCommand,
                         memoryMB: game.memoryMB,
+                        configOverride: game.configOverride,
                         controller: controller)
             .ignoresSafeArea()
             .background(Color.black)

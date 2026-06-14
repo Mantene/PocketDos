@@ -11,6 +11,7 @@ struct EmulatorWebView: UIViewRepresentable {
     var gameRelativeURL: String? = nil
     var runCommand: String? = nil
     var memoryMB: Int? = nil
+    var configOverride: String? = nil
     var controller: EmulatorController? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
@@ -27,6 +28,9 @@ struct EmulatorWebView: UIViewRepresentable {
         }
         if let memoryMB {
             query += "&mem=\(memoryMB)"
+        }
+        if let configOverride, !configOverride.isEmpty {
+            query += "&conf=" + (configOverride.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
         }
         return URL(string: BundleSchemeHandler.startURL.absoluteString + query)
             ?? BundleSchemeHandler.startURL
