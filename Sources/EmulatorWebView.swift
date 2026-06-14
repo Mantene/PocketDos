@@ -51,6 +51,15 @@ struct EmulatorWebView: UIViewRepresentable {
             print("[web] navigation failed: \(error.localizedDescription)")
         }
 
+        // The WebContent process died (a black screen). For a heavy DOSBox-X /
+        // Win9x machine this is almost always an out-of-memory Jetsam kill of the
+        // WKWebView content process. Log it clearly and recover to the menu instead
+        // of leaving a dead black screen.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            print("[web] ⚠️ WebContent process terminated — likely OUT OF MEMORY (Win9x/DOSBox-X heap exceeded the WKWebView limit). Recovering to menu.")
+            webView.load(URLRequest(url: BundleSchemeHandler.startURL))
+        }
+
         // WKWebView drops target="_blank" / window.open unless we handle it here.
         // js-dos's "Disk images (sockdrive)" quick-links are _blank anchors, so
         // without this they silently do nothing. We route .jsdos links back through
