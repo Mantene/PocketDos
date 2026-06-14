@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>PocketDOS spike</title>
+  <link rel="stylesheet" href="js-dos.css" />
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+    #app { width: 100%; height: 100%; }
+    #hud {
+      position: fixed; top: env(safe-area-inset-top, 0); left: 0; z-index: 99999;
+      color: #0f0; font: 12px/1.4 ui-monospace, Menlo, monospace;
+      background: rgba(0,0,0,.55); padding: 3px 8px; pointer-events: none;
+      max-width: 100%; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud">PocketDOS spike — booting…</div>
+
+  <!-- js-dos production bundle exposes a global `Dos` (window.Dos). -->
+  <script src="js-dos.js"></script>
+  <script>
+    "use strict";
+    const hud = document.getElementById("hud");
+    const log = (m) => { console.log(m); hud.textContent = m; };
+
+    // ---- Spike toggles -----------------------------------------------------
+    // Start conservative (no worker / no offscreen canvas) to maximize the
+    // chance the custom-scheme load works; flip these to test performance.
+    const USE_WORKER = false;        // true => dosboxWorker (off-main-thread)
+    const USE_OFFSCREEN = false;     // requires USE_WORKER = true
+    const BACKEND = "dosbox";        // js-dos auto-switches to dosboxX for Win9x configs
+    const GAME_URL = "games/game.jsdos"; // drop a .jsdos here to autostart
+    // -----------------------------------------------------------------------
+
+    // Lightweight on-screen FPS meter (rAF cadence ~ render rate).
+    let frames = 0, lastT = performance.now(), fps = 0;
+    (function tick() {
+      frames++;
+      const now = performance.now();
+      if (now - lastT >= 1000) { fps = frames; frames = 0; lastT = now; }
+      requestAnimationFrame(tick);
+    })();
+
+    // Lockdown Mode disables WebAssembly entirely (decided behavior: warn).
+    if (typeof WebAssembly === "undefined") {
+      log("WebAssembly is unavailable.\nIs iOS Lockdown Mode enabled? Disable it for PocketDOS, or use the native (sideload) build.");
+      throw new Error("WASM unavailable");
+    }
+
+    function startDos(url) {
+      const options = {
+        pathPrefix: "emulators/",   // resolves to pocketdos://app/emulators/
+        backend: BACKEND,
+        workerThread: USE_WORKER,
+        offscreenCanvas: USE_OFFSCREEN,
+        autoStart: true,
+        onEvent: (event, arg) => {
+          console.log("js-dos event:", event);
+          if (event === "emu-ready") log("emulator ready…");
+          if (event === "ci-ready") {
+            window.ci = arg;
+            log("running — ci-ready");
+            setInterval(() => {
+              try { hud.textContent = "FPS " + fps + "  |  " + arg.width() + "x" + arg.height(); }
+              catch (e) { hud.textContent = "FPS " + fps; }
+            }, 500);
+          }
+        },
+      };
+      if (url) options.url = url;
+      window.props = Dos(document.getElementById("app"), options);
+    }
+
+    // Autostart a bundled game if present; otherwise load the js-dos UI so we
+    // can still confirm the engine boots and import a game via the UI.
+    fetch(GAME_URL, { method: "HEAD" })
+      .then((r) => {
+        if (r.ok) { log("loading " + GAME_URL + " …"); startDos(GAME_URL); }
+        else { log("No bundled game.\nAdd Web/games/game.jsdos and rebuild.\nLoading js-dos UI…"); startDos(null); }
+      })
+      .catch(() => {
+        log("No bundled game.\nAdd Web/games/game.jsdos and rebuild.\nLoading js-dos UI…");
+        startDos(null);
+      });
+  </script>
+</body>
+</html>
