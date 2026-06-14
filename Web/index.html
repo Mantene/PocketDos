@@ -29,12 +29,36 @@
   <div id="app"></div>
   <div id="hud">PocketDOS spike — booting…</div>
 
+  <!-- Preload the emulators runtime (id matches what js-dos checks, so it isn't
+       loaded twice) so we can use emulators.bundle() to convert raw zips. -->
+  <script id="emulators-js" src="emulators/emulators.js"></script>
   <!-- js-dos production bundle exposes a global `Dos` (window.Dos). -->
   <script src="js-dos.js"></script>
   <script>
     "use strict";
     const hud = document.getElementById("hud");
     const log = (m) => { console.log(m); hud.textContent = m; };
+
+    // Point the emulators runtime at our bundled, same-origin assets.
+    if (typeof emulators !== "undefined") {
+      emulators.pathPrefix = "emulators/";
+      emulators.pathSuffix = "";
+    }
+
+    // Turn a raw game .zip into a runnable js-dos bundle on the fly:
+    // extract it into a default bundle (which mounts C: and drops to the DOS
+    // prompt) and hand js-dos a blob URL. .jsdos files load unchanged.
+    async function resolveBundleUrl(url) {
+      if (!url || !/\.zip(\?|#|$)/i.test(url)) return url;
+      log("converting zip → bundle…");
+      if (typeof emulators === "undefined" || !emulators.bundle) {
+        throw new Error("emulators runtime not loaded");
+      }
+      const bundle = await emulators.bundle();
+      bundle.extract(url);              // default: path "/", type "zip"
+      const u8 = await bundle.toUint8Array();
+      return URL.createObjectURL(new Blob([u8]));
+    }
 
     // ---- Spike toggles -----------------------------------------------------
     // Start conservative (no worker / no offscreen canvas) to maximize the
@@ -100,7 +124,12 @@
 
     if (PARAM_URL) {
       log("loading " + PARAM_URL + " …");
-      startDos(PARAM_URL);
+      resolveBundleUrl(PARAM_URL)
+        .then((resolved) => startDos(resolved))
+        .catch((e) => {
+          console.error("[panic] zip conversion failed: " + (e && e.message ? e.message : e));
+          log("Couldn't convert this zip into a game:\n" + (e && e.message ? e.message : e));
+        });
     } else {
       // Autostart a bundled game if present; otherwise load the js-dos UI so we
       // can still confirm the engine boots and import a game via the UI.
