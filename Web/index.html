@@ -45,27 +45,74 @@
       emulators.pathSuffix = "";
     }
 
-    // iOS starts every Web Audio context suspended until a user gesture, and
-    // js-dos creates its context after the launch tap has expired. Wrap the
-    // AudioContext constructor so we can resume js-dos's context(s) on the first
-    // touch/keypress inside the game.
+    // Audio: capture js-dos's AudioContext(s), resume them on gesture, fall back
+    // if iOS rejects the requested sample rate, and log diagnostics ([audio] ...)
+    // so we can see exactly where sound dies (creation / resume / frame output).
     (function () {
       const Orig = window.AudioContext || window.webkitAudioContext;
-      if (!Orig) return;
+      if (!Orig) { console.warn("[audio] no AudioContext in this WebView"); return; }
       const contexts = [];
+
       function Patched(...args) {
-        const ctx = new Orig(...args);
+        let ctx;
+        try {
+          ctx = new Orig(...args);
+        } catch (e) {
+          console.error("[audio] ctor failed for " + JSON.stringify(args[0]) +
+                        ": " + e.message + " — retrying at hardware rate");
+          ctx = new Orig();
+        }
         contexts.push(ctx);
+        console.log("[audio] context created requested=" + JSON.stringify(args[0]) +
+                    " actualRate=" + ctx.sampleRate + " state=" + ctx.state);
+        if (ctx.addEventListener) {
+          ctx.addEventListener("statechange", () => console.log("[audio] state → " + ctx.state));
+        }
         return ctx;
       }
       Patched.prototype = Orig.prototype;
       window.AudioContext = Patched;
       if (window.webkitAudioContext) window.webkitAudioContext = Patched;
+
       const resumeAll = () => contexts.forEach((c) => {
-        if (c.state === "suspended" && c.resume) c.resume().catch(() => {});
+        if (c.state === "suspended" && c.resume) {
+          c.resume().then(() => console.log("[audio] resumed → " + c.state))
+                    .catch((e) => console.error("[audio] resume failed: " + e.message));
+        }
       });
-      ["touchend", "pointerup", "mousedown", "keydown"].forEach((evt) =>
+      ["touchend", "pointerup", "pointerdown", "mousedown", "keydown"].forEach((evt) =>
         window.addEventListener(evt, resumeAll, true));
+
+      // Instrument the ScriptProcessor js-dos uses, to confirm frames are produced
+      // and whether they carry actual (non-zero) audio.
+      const proto = Orig.prototype;
+      if (proto && proto.createScriptProcessor) {
+        const origCSP = proto.createScriptProcessor;
+        proto.createScriptProcessor = function (...a) {
+          const node = origCSP.apply(this, a);
+          const ctx = this;
+          setTimeout(() => {
+            const handler = node.onaudioprocess;
+            if (typeof handler !== "function") {
+              console.log("[audio] scriptprocessor has no onaudioprocess (no audio source?)");
+              return;
+            }
+            let n = 0;
+            node.onaudioprocess = function (ev) {
+              const r = handler.call(this, ev);
+              if (n < 3) {
+                const ch = ev.outputBuffer.getChannelData(0);
+                let peak = 0;
+                for (let i = 0; i < ch.length; i++) { const v = Math.abs(ch[i]); if (v > peak) peak = v; }
+                console.log("[audio] frame ctx=" + ctx.state + " peak=" + peak.toFixed(4));
+                n++;
+              }
+              return r;
+            };
+          }, 1500);
+          return node;
+        };
+      }
     })();
 
     // Turn a raw game .zip into a runnable js-dos bundle on the fly:
