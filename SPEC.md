@@ -3,14 +3,15 @@
 > A not-for-profit, GPL-2-compliant iOS app to play DOS games and run DOS/Windows-9x
 > software on iPhone (iPad in V2). Repo: `git@github.com:Mantene/PocketDos.git`
 
-> **Phase 0 status (2026-06-14):** Track A spike COMPLETE on device. js-dos runs fully
-> offline in a `WKWebView`: Wolf3D plays (dosbox), and **Win 3.11 + DOS 7.1 hit 60 FPS**
-> on the `dosbox-x` backend mounting local qcow2 images. **M65 ANSWERED:** heavy Win9x
-> (95/98) **crashes the WebContent process (OOM/Jetsam)** — light dosbox-x works, heavy
-> does not → **Win9x belongs to Track B (native).** Two-track architecture validated.
-> Secondary finding: in-app cross-origin bundle downloads fail ("Load failed") from the
-> custom `pocketdos://` origin — local-file import works; URL download needs a native
-> proxy (spec G38). See branch `spike/track-a-wkwebview`.
+> **Status (2026-06-14):** Track A is a working app on device — native library + Files
+> import + tap-to-play, in-game menu (pause/save/restart/quit) + graceful error handling,
+> native FPS controls + mouse mode (per-game profiles), full soft keyboard, on-the-fly
+> zip→bundle conversion, exe pick-and-auto-run, and audio. **M65 beaten:** DOS, Win 3.11,
+> Win95, AND **Windows 98 SE all run at 60 FPS** — Win98 unlocked by the per-game
+> emulated-RAM override (`memsize=64` boots Win98 *and* fits under the WebContent memory
+> ceiling; the default 128 OOM-crashes). **Track B (native) is no longer required for V1
+> scope** — only the future path for the heaviest cases (very large RAM, 3D/Glide, max
+> dynarec speed). Branch `spike/track-a-wkwebview`.
 
 ## Architecture (decided)
 
