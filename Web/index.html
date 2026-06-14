@@ -74,10 +74,31 @@
       window.AudioContext = Patched;
       if (window.webkitAudioContext) window.webkitAudioContext = Patched;
 
+      // One-time test tone to isolate the OUTPUT path: if you HEAR this beep on
+      // first tap, ctx→speaker works and any silence is js-dos not producing
+      // samples; if you DON'T hear it, the iOS routing/session is the problem.
+      let beeped = false;
+      const testBeep = (c) => {
+        if (beeped || !c) return;
+        beeped = true;
+        try {
+          const osc = c.createOscillator();
+          const g = c.createGain();
+          g.gain.value = 0.2;
+          osc.frequency.value = 660;
+          osc.connect(g); g.connect(c.destination);
+          osc.start();
+          osc.stop(c.currentTime + 0.25);
+          console.log("[audio] TEST BEEP played (ctx=" + c.state + " rate=" + c.sampleRate +
+                      ") — did you hear it?");
+        } catch (e) { console.error("[audio] beep failed: " + e.message); }
+      };
       const resumeAll = () => contexts.forEach((c) => {
-        if (c.state === "suspended" && c.resume) {
-          c.resume().then(() => console.log("[audio] resumed → " + c.state))
+        if (c.resume && c.state === "suspended") {
+          c.resume().then(() => { console.log("[audio] resumed → " + c.state); testBeep(c); })
                     .catch((e) => console.error("[audio] resume failed: " + e.message));
+        } else if (c.state === "running") {
+          testBeep(c);
         }
       });
       ["touchend", "pointerup", "pointerdown", "mousedown", "keydown"].forEach((evt) =>
@@ -97,15 +118,18 @@
               console.log("[audio] scriptprocessor has no onaudioprocess (no audio source?)");
               return;
             }
-            let n = 0;
+            let frames = 0, maxPeak = 0, lastReport = 0;
             node.onaudioprocess = function (ev) {
               const r = handler.call(this, ev);
-              if (n < 3) {
-                const ch = ev.outputBuffer.getChannelData(0);
-                let peak = 0;
-                for (let i = 0; i < ch.length; i++) { const v = Math.abs(ch[i]); if (v > peak) peak = v; }
-                console.log("[audio] frame ctx=" + ctx.state + " peak=" + peak.toFixed(4));
-                n++;
+              const ch = ev.outputBuffer.getChannelData(0);
+              let peak = 0;
+              for (let i = 0; i < ch.length; i++) { const v = Math.abs(ch[i]); if (v > peak) peak = v; }
+              if (peak > maxPeak) maxPeak = peak;
+              frames++;
+              const now = performance.now();
+              if (now - lastReport > 4000) {
+                lastReport = now;
+                console.log("[audio] frames=" + frames + " maxPeak=" + maxPeak.toFixed(4) + " ctx=" + ctx.state);
               }
               return r;
             };
