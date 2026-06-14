@@ -33,6 +33,14 @@ struct LibraryView: View {
                                             Label("Set launch program", systemImage: "terminal")
                                         }
                                     }
+                                    Menu {
+                                        Button("Auto") { store.setMemory(nil, for: game) }
+                                        ForEach([16, 32, 48, 64, 128, 256], id: \.self) { mb in
+                                            Button("\(mb) MB") { store.setMemory(mb, for: game) }
+                                        }
+                                    } label: {
+                                        Label("Emulated memory", systemImage: "memorychip")
+                                    }
                                     Button(role: .destructive) {
                                         store.delete(game)
                                     } label: {
@@ -164,6 +172,7 @@ struct EmulatorView: View {
     var body: some View {
         EmulatorWebView(gameRelativeURL: game.webRelativeURL,
                         runCommand: game.runCommand,
+                        memoryMB: game.memoryMB,
                         controller: controller)
             .ignoresSafeArea()
             .background(Color.black)

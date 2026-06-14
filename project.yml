@@ -35,6 +35,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.mantene.pocketdos
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/PocketDOS.entitlements
         TARGETED_DEVICE_FAMILY: "1" # iPhone-only for V1
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
     dependencies:

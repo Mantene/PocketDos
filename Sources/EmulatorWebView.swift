@@ -10,6 +10,7 @@ struct EmulatorWebView: UIViewRepresentable {
     /// nil → show the bare js-dos loader (used by the spike / fallback).
     var gameRelativeURL: String? = nil
     var runCommand: String? = nil
+    var memoryMB: Int? = nil
     var controller: EmulatorController? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
@@ -23,6 +24,9 @@ struct EmulatorWebView: UIViewRepresentable {
         var query = "?url=" + (absolute.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? absolute)
         if let runCommand, !runCommand.isEmpty {
             query += "&run=" + (runCommand.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? runCommand)
+        }
+        if let memoryMB {
+            query += "&mem=\(memoryMB)"
         }
         return URL(string: BundleSchemeHandler.startURL.absoluteString + query)
             ?? BundleSchemeHandler.startURL

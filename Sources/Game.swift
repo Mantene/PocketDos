@@ -30,6 +30,8 @@ struct Game: Identifiable, Hashable {
     var runCommand: String? = nil
     /// Candidate executables found inside a zip (for the launch picker).
     var executables: [String] = []
+    /// Override for emulated RAM (DOSBox `memsize`, in MB); nil = use the bundle's own.
+    var memoryMB: Int? = nil
 
     var isZip: Bool { bundleFileName.lowercased().hasSuffix(".zip") }
     /// A zip we haven't chosen a launch command for yet, with options to offer.
@@ -42,13 +44,15 @@ struct Game: Identifiable, Hashable {
 
 /// Writes meta.json for a game folder.
 func writeGameMeta(title: String, profile: ControlProfile,
-                   runCommand: String?, executables: [String], to dir: URL) {
+                   runCommand: String?, executables: [String],
+                   memoryMB: Int?, to dir: URL) {
     var obj: [String: Any] = [
         "title": title,
         "controlProfile": profile.rawValue,
         "executables": executables,
     ]
     if let runCommand { obj["runCommand"] = runCommand }
+    if let memoryMB { obj["memoryMB"] = memoryMB }
     if let data = try? JSONSerialization.data(withJSONObject: obj) {
         try? data.write(to: dir.appendingPathComponent("meta.json"))
     }
@@ -56,14 +60,20 @@ func writeGameMeta(title: String, profile: ControlProfile,
 
 /// Persists a new control profile (preserving the other fields).
 func writeControlProfile(_ profile: ControlProfile, for game: Game) {
-    writeGameMeta(title: game.title, profile: profile,
-                  runCommand: game.runCommand, executables: game.executables, to: game.folderURL)
+    writeGameMeta(title: game.title, profile: profile, runCommand: game.runCommand,
+                  executables: game.executables, memoryMB: game.memoryMB, to: game.folderURL)
 }
 
 /// Persists a new launch command (preserving the other fields).
 func writeRunCommand(_ runCommand: String?, for game: Game) {
-    writeGameMeta(title: game.title, profile: game.controlProfile,
-                  runCommand: runCommand, executables: game.executables, to: game.folderURL)
+    writeGameMeta(title: game.title, profile: game.controlProfile, runCommand: runCommand,
+                  executables: game.executables, memoryMB: game.memoryMB, to: game.folderURL)
+}
+
+/// Persists an emulated-RAM override (preserving the other fields).
+func writeMemory(_ memoryMB: Int?, for game: Game) {
+    writeGameMeta(title: game.title, profile: game.controlProfile, runCommand: game.runCommand,
+                  executables: game.executables, memoryMB: memoryMB, to: game.folderURL)
 }
 
 /// Lists executable entries (.exe/.com/.bat) inside a zip, for the launch picker.
@@ -131,6 +141,7 @@ final class GameStore: ObservableObject {
         var profile: ControlProfile = .fps
         var runCommand: String? = nil
         var executables: [String] = []
+        var memoryMB: Int? = nil
         let meta = dir.appendingPathComponent("meta.json")
         if let data = try? Data(contentsOf: meta),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -138,11 +149,13 @@ final class GameStore: ObservableObject {
             if let p = obj["controlProfile"] as? String, let cp = ControlProfile(rawValue: p) { profile = cp }
             if let rc = obj["runCommand"] as? String { runCommand = rc }
             if let exes = obj["executables"] as? [String] { executables = exes }
+            if let mb = obj["memoryMB"] as? Int { memoryMB = mb }
         }
 
         return Game(id: dir.lastPathComponent, title: title,
                     bundleFileName: bundle.lastPathComponent, folderURL: dir,
-                    controlProfile: profile, runCommand: runCommand, executables: executables)
+                    controlProfile: profile, runCommand: runCommand,
+                    executables: executables, memoryMB: memoryMB)
     }
 
     /// Copies a picked file into a fresh library folder.
@@ -161,19 +174,27 @@ final class GameStore: ObservableObject {
 
         let title = sourceURL.deletingPathExtension().lastPathComponent
         let exes = ext.lowercased() == "zip" ? executablesInZip(at: dest) : []
-        writeGameMeta(title: title, profile: .fps, runCommand: nil, executables: exes, to: dir)
+        writeGameMeta(title: title, profile: .fps, runCommand: nil,
+                      executables: exes, memoryMB: nil, to: dir)
         reload()
     }
 
     func rename(_ game: Game, to newTitle: String) {
         writeGameMeta(title: newTitle, profile: game.controlProfile,
-                      runCommand: game.runCommand, executables: game.executables, to: game.folderURL)
+                      runCommand: game.runCommand, executables: game.executables,
+                      memoryMB: game.memoryMB, to: game.folderURL)
         reload()
     }
 
     /// Sets the launch command for a zip game ("" = drop to prompt).
     func setRunCommand(_ command: String?, for game: Game) {
         writeRunCommand(command, for: game)
+        reload()
+    }
+
+    /// Sets the emulated-RAM override (nil = use the bundle's own memsize).
+    func setMemory(_ memoryMB: Int?, for game: Game) {
+        writeMemory(memoryMB, for: game)
         reload()
     }
 
