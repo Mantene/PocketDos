@@ -25,6 +25,12 @@
     <!-- Not-for-profit, no encryption beyond OS-exempt -->
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
+    <!-- Expose the app's Documents (games library) in the Files app so users can
+         add/manage/back-up games directly (Documents/Games/...). -->
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
     <!-- Spike allows portrait + landscape; V1 gameplay will be landscape-locked. -->
     <key>UISupportedInterfaceOrientations</key>
     <array>

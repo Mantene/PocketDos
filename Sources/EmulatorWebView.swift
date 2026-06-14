@@ -6,7 +6,22 @@ import WebKit
 /// to Xcode's console (prefixed `[web]`) so the spike is debuggable on device.
 struct EmulatorWebView: UIViewRepresentable {
 
+    /// Same-origin relative path of the game to load (e.g. "lib/<id>/game.jsdos").
+    /// nil → show the bare js-dos loader (used by the spike / fallback).
+    var gameRelativeURL: String? = nil
+
     func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Start URL: the harness, optionally with ?url=<game> so it autostarts a bundle.
+    /// The game URL is absolute and same-origin (pocketdos://app/lib/...) so js-dos can
+    /// run it through `new URL()` and fetch it without a cross-origin barrier.
+    private var startURL: URL {
+        guard let rel = gameRelativeURL, !rel.isEmpty else { return BundleSchemeHandler.startURL }
+        let absolute = "\(BundleSchemeHandler.scheme)://\(BundleSchemeHandler.host)/\(rel)"
+        let encoded = absolute.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? absolute
+        return URL(string: BundleSchemeHandler.startURL.absoluteString + "?url=" + encoded)
+            ?? BundleSchemeHandler.startURL
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -32,7 +47,7 @@ struct EmulatorWebView: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator   // catch target="_blank" / window.open
 
-        webView.load(URLRequest(url: BundleSchemeHandler.startURL))
+        webView.load(URLRequest(url: startURL))
         return webView
     }
 

@@ -1,0 +1,148 @@
+import SwiftUI
+
+/// Root screen: a cover-art grid of imported games + an importer.
+struct LibraryView: View {
+    @StateObject private var store = GameStore()
+    @State private var importing = false
+    @State private var importError: String?
+
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 16)]
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if store.games.isEmpty {
+                    emptyState
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: columns, spacing: 16) {
+                            ForEach(store.games) { game in
+                                NavigationLink(value: game) {
+                                    GameTile(game: game)
+                                }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        store.delete(game)
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                }
+                            }
+                        }
+                        .padding()
+                    }
+                }
+            }
+            .navigationTitle("PocketDOS")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        importing = true
+                    } label: {
+                        Label("Import", systemImage: "plus")
+                    }
+                }
+            }
+            .navigationDestination(for: Game.self) { game in
+                EmulatorView(game: game)
+            }
+            .fileImporter(isPresented: $importing,
+                          allowedContentTypes: GameStore.importTypes,
+                          allowsMultipleSelection: true) { result in
+                handleImport(result)
+            }
+            .alert("Import failed",
+                   isPresented: Binding(get: { importError != nil },
+                                        set: { if !$0 { importError = nil } })) {
+                Button("OK", role: .cancel) { importError = nil }
+            } message: {
+                Text(importError ?? "")
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "opticaldiscdrive")
+                .font(.system(size: 56))
+                .foregroundStyle(.secondary)
+            Text("No games yet")
+                .font(.title2.weight(.semibold))
+            Text("Tap + to import a .jsdos or .zip game from Files.\nUse freeware/shareware — don't add copyrighted games.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button {
+                importing = true
+            } label: {
+                Label("Import a game", systemImage: "plus")
+                    .padding(.horizontal, 8)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(32)
+    }
+
+    private func handleImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            for url in urls {
+                do { try store.importGame(from: url) }
+                catch { importError = error.localizedDescription }
+            }
+        case .failure(let error):
+            importError = error.localizedDescription
+        }
+    }
+}
+
+/// A single library tile (placeholder cover + title).
+struct GameTile: View {
+    let game: Game
+
+    var body: some View {
+        VStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(LinearGradient(colors: [.indigo, .black],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+                .aspectRatio(3.0 / 4.0, contentMode: .fit)
+                .overlay {
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+            Text(game.title)
+                .font(.caption)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.primary)
+        }
+    }
+}
+
+/// Full-screen play surface for one game (native chrome around the WebView).
+struct EmulatorView: View {
+    let game: Game
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        EmulatorWebView(gameRelativeURL: game.webRelativeURL)
+            .ignoresSafeArea()
+            .background(Color.black)
+            .navigationBarBackButtonHidden(true)
+            .toolbar(.hidden, for: .navigationBar)
+            .overlay(alignment: .topLeading) {
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "chevron.backward.circle.fill")
+                        .font(.title)
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.white)
+                        .padding(10)
+                }
+                .padding(.top, 4)
+            }
+    }
+}

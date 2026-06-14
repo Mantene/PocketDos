@@ -18,14 +18,31 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
         URL(string: "\(scheme)://\(host)/index.html")!
     }
 
-    private let rootURL: URL
+    private let rootURL: URL   // bundled Web/ assets
+    private let gamesURL: URL  // Documents/Games (imported library)
 
     override init() {
         // `Web` is added to the project as a folder reference, so it lands at
         // <bundle resources>/Web preserving its subdirectory structure.
         let base = Bundle.main.resourceURL ?? Bundle.main.bundleURL
         self.rootURL = base.appendingPathComponent("Web", isDirectory: true)
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        self.gamesURL = docs.appendingPathComponent("Games", isDirectory: true)
         super.init()
+    }
+
+    /// Resolves a request path to a file, keeping each request inside its allowed root:
+    ///  - `lib/<id>/...` → Documents/Games (imported games, same origin → no CORS)
+    ///  - everything else → bundled Web/
+    /// Returns nil on path-traversal attempts.
+    private func resolveFile(_ relPath: String) -> URL? {
+        if relPath.hasPrefix("lib/") {
+            let sub = String(relPath.dropFirst("lib/".count))
+            let file = gamesURL.appendingPathComponent(sub).standardizedFileURL
+            return file.path.hasPrefix(gamesURL.standardizedFileURL.path) ? file : nil
+        }
+        let file = rootURL.appendingPathComponent(relPath).standardizedFileURL
+        return file.path.hasPrefix(rootURL.standardizedFileURL.path) ? file : nil
     }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
@@ -33,18 +50,13 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
             task.didFailWithError(URLError(.badURL)); return
         }
 
-        // Map URL path onto Web/. e.g. pocketdos://app/emulators/wdosbox-x.wasm
+        // Map URL path onto Web/ (bundled) or Documents/Games (lib/ → imported).
         var relPath = url.path
         if relPath.hasPrefix("/") { relPath.removeFirst() }
         if relPath.isEmpty { relPath = "index.html" }
 
-        // Guard against path traversal escaping the Web/ root.
-        let fileURL = rootURL.appendingPathComponent(relPath).standardizedFileURL
-        guard fileURL.path.hasPrefix(rootURL.standardizedFileURL.path) else {
-            respondNotFound(url: url, task: task); return
-        }
-
-        guard let data = try? Data(contentsOf: fileURL) else {
+        guard let fileURL = resolveFile(relPath),
+              let data = try? Data(contentsOf: fileURL) else {
             respondNotFound(url: url, task: task); return
         }
 
