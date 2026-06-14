@@ -30,6 +30,23 @@ final class EmulatorController: ObservableObject {
         webView?.reload()
     }
 
+    // MARK: - Key input (codes from js-dos src/window/dos/controls/keys.ts)
+
+    /// Press a key down (hold). Pair with keyUp.
+    func keyDown(_ code: Int) {
+        eval("window.ci && window.ci.sendKeyEvent(\(code), true)")
+    }
+
+    /// Release a held key.
+    func keyUp(_ code: Int) {
+        eval("window.ci && window.ci.sendKeyEvent(\(code), false)")
+    }
+
+    /// Press and release a key (tap).
+    func tapKey(_ code: Int) {
+        eval("window.ci && window.ci.simulateKeyPress(\(code))")
+    }
+
     func reportError(_ raw: String) {
         // Called from WebKit delegate callbacks that may fire during a SwiftUI
         // view update; defer the @Published mutation to avoid "Publishing changes

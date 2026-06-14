@@ -127,6 +127,7 @@ struct EmulatorView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var controller = EmulatorController()
     @State private var showMenu = false
+    @State private var showControls = true
 
     var body: some View {
         EmulatorWebView(gameRelativeURL: game.webRelativeURL, controller: controller)
@@ -135,8 +136,21 @@ struct EmulatorView: View {
             .navigationBarBackButtonHidden(true)
             .toolbar(.hidden, for: .navigationBar)
             .overlay(alignment: .topLeading) { backButton }
-            .overlay(alignment: .bottomTrailing) { menuButton }
+            .overlay(alignment: .topTrailing) { menuButton }
+            .overlay(alignment: .bottomLeading) {
+                if showControls {
+                    DPad(controller: controller)
+                        .padding(.leading, 16).padding(.bottom, 28)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if showControls {
+                    ActionCluster(controller: controller)
+                        .padding(.trailing, 16).padding(.bottom, 28)
+                }
+            }
             .confirmationDialog("Game menu", isPresented: $showMenu, titleVisibility: .visible) {
+                Button(showControls ? "Hide controls" : "Show controls") { showControls.toggle() }
                 Button(controller.isPaused ? "Resume" : "Pause") { controller.togglePause() }
                 Button("Save state") { controller.saveState() }
                 Button("Restart") { controller.restart() }
