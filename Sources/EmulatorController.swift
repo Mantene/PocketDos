@@ -31,7 +31,13 @@ final class EmulatorController: ObservableObject {
     }
 
     func reportError(_ raw: String) {
-        if loadError == nil { loadError = raw }
+        // Called from WebKit delegate callbacks that may fire during a SwiftUI
+        // view update; defer the @Published mutation to avoid "Publishing changes
+        // from within view updates" undefined behavior.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.loadError == nil else { return }
+            self.loadError = raw
+        }
     }
 
     private func eval(_ js: String) {
