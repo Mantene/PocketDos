@@ -3,10 +3,14 @@
 > A not-for-profit, GPL-2-compliant iOS app to play DOS games and run DOS/Windows-9x
 > software on iPhone (iPad in V2). Repo: `git@github.com:Mantene/PocketDos.git`
 
-> **Phase 0 status (2026-06-14):** Track A spike SUCCEEDS on device — js-dos (WASM
-> DOSBox/-X) runs fully offline in a `WKWebView`; Wolfenstein 3D plays from a
-> user-imported `.jsdos`. Remaining make-or-break: **Windows 98SE speed (M65)** — not
-> yet measured. See branch `spike/track-a-wkwebview`.
+> **Phase 0 status (2026-06-14):** Track A spike COMPLETE on device. js-dos runs fully
+> offline in a `WKWebView`: Wolf3D plays (dosbox), and **Win 3.11 + DOS 7.1 hit 60 FPS**
+> on the `dosbox-x` backend mounting local qcow2 images. **M65 ANSWERED:** heavy Win9x
+> (95/98) **crashes the WebContent process (OOM/Jetsam)** — light dosbox-x works, heavy
+> does not → **Win9x belongs to Track B (native).** Two-track architecture validated.
+> Secondary finding: in-app cross-origin bundle downloads fail ("Load failed") from the
+> custom `pocketdos://` origin — local-file import works; URL download needs a native
+> proxy (spec G38). See branch `spike/track-a-wkwebview`.
 
 ## Architecture (decided)
 
@@ -173,7 +177,8 @@ _Open in D:_ D23 FPS/cycle acceptance targets; D25 frame pacing/vsync + thermal 
 
 | # | Risk |
 |---|---|
-| M65 | **Win9x speed** under Track A WASM-JIT and Track B interpreter — the #1 unknown; **Phase 0 spike measures it on a real A14+ device.** |
+| M65 | **RESOLVED (2026-06-14):** heavy Win9x (95/98) OOM-crashes the WKWebView WebContent process; light dosbox-x (Win 3.11, DOS 7.1) runs at 60 FPS. → Track A = DOS + light Windows; **Win9x (95/98) → Track B (native)**. |
+| M65b | In-app cross-origin bundle download fails from the `pocketdos://` origin ("Load failed"); local-file import works. Fix for spec G38 = native URLSession proxy that downloads then serves via the bundle scheme. |
 | M66 | **App Review** acceptance of a user-content emulator (iDOS history) — re-check Guideline 4.7 before submitting Track A. |
 | M67 | Confirm DOSBox Pure's exact license file/text and that `DISABLE_DYNAREC` builds cleanly for iOS arm64 today. |
 | M68 | Confirm no GPL contributor objects to App Store distribution — **gated on caiiiycuk consent (B9)** for Track A. |
