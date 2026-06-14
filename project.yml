@@ -5,6 +5,11 @@ options:
   deploymentTarget:
     iOS: "17.0"
 
+packages:
+  ZIPFoundation:
+    url: https://github.com/weichsel/ZIPFoundation.git
+    from: "0.9.19"
+
 settings:
   base:
     MARKETING_VERSION: "0.0.1"
@@ -32,6 +37,8 @@ targets:
         INFOPLIST_FILE: Sources/Info.plist
         TARGETED_DEVICE_FAMILY: "1" # iPhone-only for V1
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    dependencies:
+      - package: ZIPFoundation
 
 # A shared scheme so Xcode's Build/Run are available (XcodeGen doesn't create one otherwise).
 schemes:

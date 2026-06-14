@@ -9,18 +9,22 @@ struct EmulatorWebView: UIViewRepresentable {
     /// Same-origin relative path of the game to load (e.g. "lib/<id>/game.jsdos").
     /// nil → show the bare js-dos loader (used by the spike / fallback).
     var gameRelativeURL: String? = nil
+    var runCommand: String? = nil
     var controller: EmulatorController? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
 
-    /// Start URL: the harness, optionally with ?url=<game> so it autostarts a bundle.
-    /// The game URL is absolute and same-origin (pocketdos://app/lib/...) so js-dos can
-    /// run it through `new URL()` and fetch it without a cross-origin barrier.
+    /// Start URL: the harness, optionally with ?url=<game> (and &run=<cmd> for zips)
+    /// so it autostarts a bundle. The game URL is absolute and same-origin
+    /// (pocketdos://app/lib/...) so js-dos can fetch it without a cross-origin barrier.
     private var startURL: URL {
         guard let rel = gameRelativeURL, !rel.isEmpty else { return BundleSchemeHandler.startURL }
         let absolute = "\(BundleSchemeHandler.scheme)://\(BundleSchemeHandler.host)/\(rel)"
-        let encoded = absolute.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? absolute
-        return URL(string: BundleSchemeHandler.startURL.absoluteString + "?url=" + encoded)
+        var query = "?url=" + (absolute.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? absolute)
+        if let runCommand, !runCommand.isEmpty {
+            query += "&run=" + (runCommand.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? runCommand)
+        }
+        return URL(string: BundleSchemeHandler.startURL.absoluteString + query)
             ?? BundleSchemeHandler.startURL
     }
 

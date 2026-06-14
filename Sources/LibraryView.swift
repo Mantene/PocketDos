@@ -5,6 +5,8 @@ struct LibraryView: View {
     @StateObject private var store = GameStore()
     @State private var importing = false
     @State private var importError: String?
+    @State private var playingGame: Game?
+    @State private var setupGame: Game?
 
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 16)]
 
@@ -17,11 +19,20 @@ struct LibraryView: View {
                     ScrollView {
                         LazyVGrid(columns: columns, spacing: 16) {
                             ForEach(store.games) { game in
-                                NavigationLink(value: game) {
+                                Button {
+                                    launch(game)
+                                } label: {
                                     GameTile(game: game)
                                 }
                                 .buttonStyle(.plain)
                                 .contextMenu {
+                                    if game.isZip {
+                                        Button {
+                                            setupGame = game
+                                        } label: {
+                                            Label("Set launch program", systemImage: "terminal")
+                                        }
+                                    }
                                     Button(role: .destructive) {
                                         store.delete(game)
                                     } label: {
@@ -44,8 +55,16 @@ struct LibraryView: View {
                     }
                 }
             }
-            .navigationDestination(for: Game.self) { game in
+            .navigationDestination(item: $playingGame) { game in
                 EmulatorView(game: game)
+            }
+            .sheet(item: $setupGame) { game in
+                LaunchPickerView(game: game) { choice in
+                    store.setRunCommand(choice, for: game)
+                    setupGame = nil
+                    // Launch with the freshly chosen command.
+                    playingGame = store.game(byId: game.id)
+                }
             }
             .fileImporter(isPresented: $importing,
                           allowedContentTypes: GameStore.importTypes,
@@ -82,6 +101,14 @@ struct LibraryView: View {
             .buttonStyle(.borderedProminent)
         }
         .padding(32)
+    }
+
+    private func launch(_ game: Game) {
+        if game.needsLaunchSetup {
+            setupGame = game        // ask which program to run first
+        } else {
+            playingGame = game
+        }
     }
 
     private func handleImport(_ result: Result<[URL], Error>) {
@@ -135,7 +162,9 @@ struct EmulatorView: View {
     }
 
     var body: some View {
-        EmulatorWebView(gameRelativeURL: game.webRelativeURL, controller: controller)
+        EmulatorWebView(gameRelativeURL: game.webRelativeURL,
+                        runCommand: game.runCommand,
+                        controller: controller)
             .ignoresSafeArea()
             .background(Color.black)
             .navigationBarBackButtonHidden(true)

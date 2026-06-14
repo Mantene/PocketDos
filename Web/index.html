@@ -48,7 +48,7 @@
     // Turn a raw game .zip into a runnable js-dos bundle on the fly:
     // extract it into a default bundle (which mounts C: and drops to the DOS
     // prompt) and hand js-dos a blob URL. .jsdos files load unchanged.
-    async function resolveBundleUrl(url) {
+    async function resolveBundleUrl(url, runCmd) {
       if (!url || !/\.zip(\?|#|$)/i.test(url)) return url;
       log("converting zip → bundle…");
       if (typeof emulators === "undefined" || !emulators.bundle) {
@@ -56,6 +56,18 @@
       }
       const bundle = await emulators.bundle();
       bundle.extract(url);              // default: path "/", type "zip"
+      // Auto-run a chosen executable: append to [autoexec] (which already does
+      // `mount c .` + `c:`) so it runs after the drive is mounted.
+      if (runCmd) {
+        const norm = runCmd.replace(/\//g, "\\");
+        const slash = norm.lastIndexOf("\\");
+        const dir = slash >= 0 ? norm.slice(0, slash) : "";
+        const exe = slash >= 0 ? norm.slice(slash + 1) : norm;
+        let lines = "";
+        if (dir) lines += "cd \\" + dir + "\n";
+        lines += exe + "\n";
+        bundle.dosboxConf += "\n" + lines;
+      }
       const u8 = await bundle.toUint8Array();
       return URL.createObjectURL(new Blob([u8]));
     }
@@ -123,10 +135,11 @@
     // A ?url= param (set by the native WKUIDelegate when a sockdrive/_blank
     // quick-link is tapped, or for "load by url") takes priority.
     const PARAM_URL = new URLSearchParams(location.search).get("url");
+    const PARAM_RUN = new URLSearchParams(location.search).get("run");
 
     if (PARAM_URL) {
       log("loading " + PARAM_URL + " …");
-      resolveBundleUrl(PARAM_URL)
+      resolveBundleUrl(PARAM_URL, PARAM_RUN)
         .then((resolved) => startDos(resolved))
         .catch((e) => {
           console.error("[panic] zip conversion failed: " + (e && e.message ? e.message : e));

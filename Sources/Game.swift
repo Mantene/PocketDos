@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UniformTypeIdentifiers
+import ZIPFoundation
 
 /// How a game is controlled on screen (persisted per game).
 enum ControlProfile: String, CaseIterable {
@@ -24,23 +25,58 @@ struct Game: Identifiable, Hashable {
     var bundleFileName: String  // e.g. "game.jsdos"
     var folderURL: URL
     var controlProfile: ControlProfile = .fps
+    /// Launch command for raw-zip games: nil = not chosen yet, "" = drop to DOS
+    /// prompt, otherwise the executable path (e.g. "DOOM/DOOM.EXE") to auto-run.
+    var runCommand: String? = nil
+    /// Candidate executables found inside a zip (for the launch picker).
+    var executables: [String] = []
+
+    var isZip: Bool { bundleFileName.lowercased().hasSuffix(".zip") }
+    /// A zip we haven't chosen a launch command for yet, with options to offer.
+    var needsLaunchSetup: Bool { isZip && runCommand == nil && !executables.isEmpty }
 
     /// Path the WKWebView's BundleSchemeHandler serves (same origin as the page),
     /// e.g. "lib/<id>/game.jsdos" → Documents/Games/<id>/game.jsdos.
     var webRelativeURL: String { "lib/\(id)/\(bundleFileName)" }
 }
 
-/// Writes meta.json (title + control profile) for a game folder.
-func writeGameMeta(title: String, profile: ControlProfile, to dir: URL) {
-    let obj: [String: Any] = ["title": title, "controlProfile": profile.rawValue]
+/// Writes meta.json for a game folder.
+func writeGameMeta(title: String, profile: ControlProfile,
+                   runCommand: String?, executables: [String], to dir: URL) {
+    var obj: [String: Any] = [
+        "title": title,
+        "controlProfile": profile.rawValue,
+        "executables": executables,
+    ]
+    if let runCommand { obj["runCommand"] = runCommand }
     if let data = try? JSONSerialization.data(withJSONObject: obj) {
         try? data.write(to: dir.appendingPathComponent("meta.json"))
     }
 }
 
-/// Persists a new control profile for a game (preserving its title).
+/// Persists a new control profile (preserving the other fields).
 func writeControlProfile(_ profile: ControlProfile, for game: Game) {
-    writeGameMeta(title: game.title, profile: profile, to: game.folderURL)
+    writeGameMeta(title: game.title, profile: profile,
+                  runCommand: game.runCommand, executables: game.executables, to: game.folderURL)
+}
+
+/// Persists a new launch command (preserving the other fields).
+func writeRunCommand(_ runCommand: String?, for game: Game) {
+    writeGameMeta(title: game.title, profile: game.controlProfile,
+                  runCommand: runCommand, executables: game.executables, to: game.folderURL)
+}
+
+/// Lists executable entries (.exe/.com/.bat) inside a zip, for the launch picker.
+func executablesInZip(at url: URL) -> [String] {
+    guard let archive = try? Archive(url: url, accessMode: .read) else { return [] }
+    var result: [String] = []
+    for entry in archive {
+        let lower = entry.path.lowercased()
+        if lower.hasSuffix(".exe") || lower.hasSuffix(".com") || lower.hasSuffix(".bat") {
+            result.append(entry.path)
+        }
+    }
+    return result.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
 }
 
 /// Manages the on-disk game library under Documents/Games (Files-app visible).
@@ -93,16 +129,20 @@ final class GameStore: ObservableObject {
 
         var title = bundle.deletingPathExtension().lastPathComponent
         var profile: ControlProfile = .fps
+        var runCommand: String? = nil
+        var executables: [String] = []
         let meta = dir.appendingPathComponent("meta.json")
         if let data = try? Data(contentsOf: meta),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let t = obj["title"] as? String, !t.isEmpty { title = t }
             if let p = obj["controlProfile"] as? String, let cp = ControlProfile(rawValue: p) { profile = cp }
+            if let rc = obj["runCommand"] as? String { runCommand = rc }
+            if let exes = obj["executables"] as? [String] { executables = exes }
         }
 
         return Game(id: dir.lastPathComponent, title: title,
                     bundleFileName: bundle.lastPathComponent, folderURL: dir,
-                    controlProfile: profile)
+                    controlProfile: profile, runCommand: runCommand, executables: executables)
     }
 
     /// Copies a picked file into a fresh library folder.
@@ -120,13 +160,25 @@ final class GameStore: ObservableObject {
         try fm.copyItem(at: sourceURL, to: dest)
 
         let title = sourceURL.deletingPathExtension().lastPathComponent
-        writeGameMeta(title: title, profile: .fps, to: dir)
+        let exes = ext.lowercased() == "zip" ? executablesInZip(at: dest) : []
+        writeGameMeta(title: title, profile: .fps, runCommand: nil, executables: exes, to: dir)
         reload()
     }
 
     func rename(_ game: Game, to newTitle: String) {
-        writeGameMeta(title: newTitle, profile: game.controlProfile, to: game.folderURL)
+        writeGameMeta(title: newTitle, profile: game.controlProfile,
+                      runCommand: game.runCommand, executables: game.executables, to: game.folderURL)
         reload()
+    }
+
+    /// Sets the launch command for a zip game ("" = drop to prompt).
+    func setRunCommand(_ command: String?, for game: Game) {
+        writeRunCommand(command, for: game)
+        reload()
+    }
+
+    func game(byId id: String) -> Game? {
+        games.first { $0.id == id }
     }
 
     func delete(_ game: Game) {
