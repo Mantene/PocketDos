@@ -79,6 +79,25 @@ struct DPad: View {
     }
 }
 
+/// Mouse profile: tap the screen to position + left-click (js-dos native);
+/// this adds an explicit right-click button (e.g. examine/cancel in adventures).
+struct MouseControls: View {
+    let controller: EmulatorController
+    var body: some View {
+        Button {
+            controller.rightClick()
+        } label: {
+            Text("R‑Click")
+                .font(.headline)
+                .foregroundStyle(.white)
+                .frame(width: 96, height: 54)
+                .background(.white.opacity(0.16), in: Capsule())
+                .overlay(Capsule().stroke(.white.opacity(0.25), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 /// Weapons row + fire/use for the bottom-right (FPS layout).
 struct ActionCluster: View {
     let controller: EmulatorController

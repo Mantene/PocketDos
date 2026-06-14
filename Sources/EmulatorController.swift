@@ -47,6 +47,14 @@ final class EmulatorController: ObservableObject {
         eval("window.ci && window.ci.simulateKeyPress(\(code))")
     }
 
+    /// Right-click at the current cursor position (button 1 in js-dos).
+    /// (Left-click + cursor positioning is handled by js-dos's own absolute
+    /// touch handling on the canvas when no overlay covers it.)
+    func rightClick() {
+        eval("(function(){var c=window.ci;if(c){c.sendMouseButton(1,true);"
+           + "setTimeout(function(){c.sendMouseButton(1,false);},60);}})()")
+    }
+
     func reportError(_ raw: String) {
         // Called from WebKit delegate callbacks that may fire during a SwiftUI
         // view update; defer the @Published mutation to avoid "Publishing changes
