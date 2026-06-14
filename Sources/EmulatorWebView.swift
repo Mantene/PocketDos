@@ -9,8 +9,9 @@ struct EmulatorWebView: UIViewRepresentable {
     /// Same-origin relative path of the game to load (e.g. "lib/<id>/game.jsdos").
     /// nil → show the bare js-dos loader (used by the spike / fallback).
     var gameRelativeURL: String? = nil
+    var controller: EmulatorController? = nil
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
 
     /// Start URL: the harness, optionally with ?url=<game> so it autostarts a bundle.
     /// The game URL is absolute and same-origin (pocketdos://app/lib/...) so js-dos can
@@ -47,6 +48,7 @@ struct EmulatorWebView: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator   // catch target="_blank" / window.open
 
+        self.controller?.webView = webView
         webView.load(URLRequest(url: startURL))
         return webView
     }
@@ -54,10 +56,26 @@ struct EmulatorWebView: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
-        func userContentController(_ controller: WKUserContentController,
+        let emulator: EmulatorController?
+
+        init(controller: EmulatorController?) {
+            self.emulator = controller
+            super.init()
+        }
+
+        func userContentController(_ userContentController: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
-            if message.name == "console" {
-                print("[web] \(message.body)")
+            guard message.name == "console" else { return }
+            let text = "\(message.body)"
+            print("[web] \(text)")
+
+            // Surface js-dos bundle-load failures as a native alert.
+            let lower = text.lowercased()
+            if lower.contains("[panic]")
+                || lower.contains("broken bundle")
+                || lower.contains("compression method not supported")
+                || lower.contains("can't send bundles to backend") {
+                emulator?.reportError(text)
             }
         }
 
@@ -68,11 +86,10 @@ struct EmulatorWebView: UIViewRepresentable {
 
         // The WebContent process died (a black screen). For a heavy DOSBox-X /
         // Win9x machine this is almost always an out-of-memory Jetsam kill of the
-        // WKWebView content process. Log it clearly and recover to the menu instead
-        // of leaving a dead black screen.
+        // WKWebView content process. Report it so the game view returns to the library.
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            print("[web] ⚠️ WebContent process terminated — likely OUT OF MEMORY (Win9x/DOSBox-X heap exceeded the WKWebView limit). Recovering to menu.")
-            webView.load(URLRequest(url: BundleSchemeHandler.startURL))
+            print("[web] ⚠️ WebContent process terminated — likely OUT OF MEMORY (Win9x/DOSBox-X heap exceeded the WKWebView limit).")
+            emulator?.reportError("__CRASH__")
         }
 
         // WKWebView drops target="_blank" / window.open unless we handle it here.

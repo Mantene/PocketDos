@@ -125,24 +125,57 @@ struct GameTile: View {
 struct EmulatorView: View {
     let game: Game
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var controller = EmulatorController()
+    @State private var showMenu = false
 
     var body: some View {
-        EmulatorWebView(gameRelativeURL: game.webRelativeURL)
+        EmulatorWebView(gameRelativeURL: game.webRelativeURL, controller: controller)
             .ignoresSafeArea()
             .background(Color.black)
             .navigationBarBackButtonHidden(true)
             .toolbar(.hidden, for: .navigationBar)
-            .overlay(alignment: .topLeading) {
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "chevron.backward.circle.fill")
-                        .font(.title)
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(.white)
-                        .padding(10)
-                }
-                .padding(.top, 4)
+            .overlay(alignment: .topLeading) { backButton }
+            .overlay(alignment: .bottomTrailing) { menuButton }
+            .confirmationDialog("Game menu", isPresented: $showMenu, titleVisibility: .visible) {
+                Button(controller.isPaused ? "Resume" : "Pause") { controller.togglePause() }
+                Button("Save state") { controller.saveState() }
+                Button("Restart") { controller.restart() }
+                Button("Quit to Library", role: .destructive) { dismiss() }
+                Button("Cancel", role: .cancel) {}
             }
+            .alert("Couldn't run this game",
+                   isPresented: Binding(get: { controller.loadError != nil },
+                                        set: { if !$0 { controller.loadError = nil } })) {
+                Button("Back to Library") { dismiss() }
+            } message: {
+                Text(friendlyEmulatorError(controller.loadError ?? ""))
+            }
+    }
+
+    private var backButton: some View {
+        Button {
+            dismiss()
+        } label: {
+            Image(systemName: "chevron.backward.circle.fill")
+                .font(.title)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.white)
+                .padding(10)
+        }
+        .padding(.top, 4)
+    }
+
+    private var menuButton: some View {
+        Button {
+            showMenu = true
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.title2)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.white)
+                .padding(12)
+                .background(.black.opacity(0.45), in: Circle())
+        }
+        .padding(16)
     }
 }
