@@ -22,3 +22,7 @@ xcuserdata/
 # User-provided game content (never commit copyrighted games)
 Web/games/*
 !Web/games/.gitkeep
+
+# Backup of the stock js-dos wdosbox-x assets (kept locally before swapping in
+# the custom FluidSynth build); recoverable from js-dos, not worth committing.
+Web/emulators/.orig-backup/

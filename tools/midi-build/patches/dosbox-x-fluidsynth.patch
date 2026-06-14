@@ -1,0 +1,1147 @@
+diff --git a/include/fluidsynth/config_emscripten.h b/include/fluidsynth/config_emscripten.h
+new file mode 100644
+index 000000000..72ae18ea1
+--- /dev/null
++++ b/include/fluidsynth/config_emscripten.h
+@@ -0,0 +1,66 @@
++/* FluidSynth build config for Emscripten / WebAssembly (POSIX-like).
++ *
++ * Added for the PocketDOS General-MIDI build: the bundled DOSBox-X FluidSynth
++ * only shipped a Windows config (config_win32.h), which forces <io.h>,
++ * <windows.h> and a conflicting `typedef int socklen_t`. Under Emscripten we
++ * want a POSIX configuration with no Windows headers, no networking server,
++ * and no platform audio driver (DOSBox-X pulls samples directly via
++ * fluid_synth_write_s16, so no fluid audio driver is needed). */
++
++#ifndef _CONFIG_EMSCRIPTEN_H
++#define _CONFIG_EMSCRIPTEN_H
++
++#define FLUIDSYNTHVERSION "2.x-jsdos"
++
++/* On Windows these came from <windows.h>; the bundled fluid sources rely on
++ * them. Provide them for the POSIX/Emscripten build (no other header defines
++ * TRUE/FALSE/boolean in this tree). */
++#ifndef TRUE
++#define TRUE 1
++#endif
++#ifndef FALSE
++#define FALSE 0
++#endif
++typedef int boolean;
++
++/* Headers available under the Emscripten musl sysroot. */
++#define HAVE_STRING_H 1
++#define HAVE_STDLIB_H 1
++#define HAVE_STDIO_H 1
++#define HAVE_MATH_H 1
++#define HAVE_ERRNO_H 1
++#define HAVE_STDARG_H 1
++#define HAVE_UNISTD_H 1
++#define HAVE_FCNTL_H 1
++#define HAVE_SYS_TYPES_H 1
++#define HAVE_SYS_STAT_H 1
++#define HAVE_SYS_TIME_H 1
++#define HAVE_LIMITS_H 1
++/* fluid_sys.c compiles its socket server helper unconditionally; Emscripten's
++ * musl provides these POSIX socket headers (the server is never started). */
++#define HAVE_SYS_SOCKET_H 1
++#define HAVE_NETINET_IN_H 1
++#define HAVE_NETINET_TCP_H 1
++#define HAVE_ARPA_INET_H 1
++
++/* Deliberately NOT defined: HAVE_IO_H, HAVE_WINDOWS_H (Windows-only),
++ * HAVE_SYS_SOCKET_H / HAVE_NETINET_IN_H / HAVE_PTHREAD_H (server + threads
++ * unused; this WASM build is single-threaded). Leaving socklen_t alone so it
++ * matches the Emscripten sysroot definition. */
++
++/* Threading abstraction: Emscripten provides <pthread.h> (functional stubs even
++ * in single-threaded builds), so route fluid_mutex.h / fluid_sys.h to the
++ * pthread path instead of the Windows path. */
++#define HAVE_PTHREAD_H 1
++
++#define WITHOUT_SERVER 1
++#define SDL2_SUPPORT 0
++#define DSOUND_SUPPORT 0
++#define WINMIDI_SUPPORT 0
++#define AUFILE_SUPPORT 0
++#define WITH_FLOAT 1
++#define WITH_PROFILING 0
++
++#define DEFAULT_SOUNDFONT "TIMGM6MB.SF2"
++
++#endif /* _CONFIG_EMSCRIPTEN_H */
+diff --git a/include/fluidsynth/config_win32.h b/include/fluidsynth/config_win32.h
+index fd4722801..82a0d501b 100644
+--- a/include/fluidsynth/config_win32.h
++++ b/include/fluidsynth/config_win32.h
+@@ -1,3 +1,8 @@
++#if defined(__EMSCRIPTEN__)
++/* PocketDOS GM build: several fluid sources include this Windows config
++ * directly. Under Emscripten redirect to the POSIX config instead. */
++#include "fluidsynth/config_emscripten.h"
++#else
+ #define FLUIDSYNTHVERSION "@VERSION@"
+ 
+ #define HAVE_STRING_H 1
+@@ -56,3 +61,4 @@ typedef int socklen_t;
+ #endif
+ 
+ #define DEFAULT_SOUNDFONT "generalmidi.sf2"
++#endif /* __EMSCRIPTEN__ */
+diff --git a/src/hardware/imfc.cpp b/src/hardware/imfc.cpp
+index 17bfcf194..ddc3c6e33 100644
+--- a/src/hardware/imfc.cpp
++++ b/src/hardware/imfc.cpp
+@@ -795,6 +795,7 @@ static_assert(sizeof(OperatorDefinition) == 8,
+               "OperatorDefinition needs to be 8 in size!");
+ 
+ struct VoiceDefinition {
++	VoiceDefinition();   // PocketDOS: strong out-of-line def (clang -Oz drops the implicit one)
+ private:
+ 	// clang-format off
+ 	// +00~+06: Name of instrument
+@@ -1299,6 +1300,7 @@ static_assert(sizeof(ConfigurationData) == 0xA0,
+ struct YmChannelData; // forward declaration
+ 
+ struct InstrumentParameters {
++	InstrumentParameters();   // PocketDOS: strong out-of-line def (clang -Oz drops the implicit one)
+ private:
+ 	InstrumentParameters& operator=(const InstrumentParameters& other)
+ 	{ /* don't use */
+@@ -1378,6 +1380,7 @@ public:
+ };
+ 
+ struct YmChannelData {
++	YmChannelData();   // PocketDOS: strong out-of-line def (clang -Oz drops the implicit one)
+ private:
+ 	YmChannelData& operator=(const YmChannelData& other)
+ 	{ /* don't use */
+@@ -13062,3 +13065,10 @@ void IMFC_Init()
+ 	}
+ 	AddExitFunction(AddExitFunctionFuncPair(IMFC_ShutDown), true);
+ }
++
++// PocketDOS: explicit out-of-line default constructors. clang at -Oz leaves the
++// implicit (linkonce_odr) versions of these as undefined references from the
++// `= {}` member arrays; defining them out-of-line here emits strong symbols.
++VoiceDefinition::VoiceDefinition() = default;
++InstrumentParameters::InstrumentParameters() = default;
++YmChannelData::YmChannelData() = default;
+diff --git a/src/libs/fluidsynth/fluid_adriver.c b/src/libs/fluidsynth/fluid_adriver.c
+index 55ef45d08..2f3b29b6e 100644
+--- a/src/libs/fluidsynth/fluid_adriver.c
++++ b/src/libs/fluidsynth/fluid_adriver.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_adriver.h"
+ #include "fluid_settings.h"
+ 
+diff --git a/src/libs/fluidsynth/fluid_adsr_env.c b/src/libs/fluidsynth/fluid_adsr_env.c
+index 435089ee4..bba37df52 100644
+--- a/src/libs/fluidsynth/fluid_adsr_env.c
++++ b/src/libs/fluidsynth/fluid_adsr_env.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_adsr_env.h"
+ 
+ void 
+diff --git a/src/libs/fluidsynth/fluid_atomic.h b/src/libs/fluidsynth/fluid_atomic.h
+index 091148571..dc00c72ca 100644
+--- a/src/libs/fluidsynth/fluid_atomic.h
++++ b/src/libs/fluidsynth/fluid_atomic.h
+@@ -29,7 +29,7 @@
+ #define _FLUID_ATOMIC_H
+ 
+ 
+-#if defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4)
++#if defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || defined(__EMSCRIPTEN__)
+ 
+ #ifdef __ATOMIC_SEQ_CST
+ // Use GCC's new atomic operations.
+diff --git a/src/libs/fluidsynth/fluid_aufile.c b/src/libs/fluidsynth/fluid_aufile.c
+index dc2db9c67..a76a8a181 100644
+--- a/src/libs/fluidsynth/fluid_aufile.c
++++ b/src/libs/fluidsynth/fluid_aufile.c
+@@ -26,7 +26,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_adriver.h"
+ #include "fluid_settings.h"
+ #include "fluid_sys.h"
+diff --git a/src/libs/fluidsynth/fluid_chan.c b/src/libs/fluidsynth/fluid_chan.c
+index 48b3e8e4f..8ba0e0aba 100644
+--- a/src/libs/fluidsynth/fluid_chan.c
++++ b/src/libs/fluidsynth/fluid_chan.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_chan.h"
+ #include "fluid_mod.h"
+ #include "fluid_synth.h"
+diff --git a/src/libs/fluidsynth/fluid_chorus.c b/src/libs/fluidsynth/fluid_chorus.c
+index 8ed0d59a8..4314e1763 100644
+--- a/src/libs/fluidsynth/fluid_chorus.c
++++ b/src/libs/fluidsynth/fluid_chorus.c
+@@ -67,7 +67,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_chorus.h"
+ #include "fluid_sys.h"
+ 
+diff --git a/src/libs/fluidsynth/fluid_cmd.c b/src/libs/fluidsynth/fluid_cmd.c
+index 710d2a2ef..0b2b29e27 100644
+--- a/src/libs/fluidsynth/fluid_cmd.c
++++ b/src/libs/fluidsynth/fluid_cmd.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include <fcntl.h>
+ 
+ #include "fluidsynth_priv.h"
+diff --git a/src/libs/fluidsynth/fluid_conv.c b/src/libs/fluidsynth/fluid_conv.c
+index 9dfbdaff8..91676efe3 100644
+--- a/src/libs/fluidsynth/fluid_conv.c
++++ b/src/libs/fluidsynth/fluid_conv.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_conv.h"
+ 
+ /* conversion tables */
+diff --git a/src/libs/fluidsynth/fluid_defsfont.c b/src/libs/fluidsynth/fluid_defsfont.c
+index 37a287eff..b661360a4 100644
+--- a/src/libs/fluidsynth/fluid_defsfont.c
++++ b/src/libs/fluidsynth/fluid_defsfont.c
+@@ -23,7 +23,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_defsfont.h"
+ /* Todo: Get rid of that 'include' */
+ #include "fluid_sys.h"
+diff --git a/src/libs/fluidsynth/fluid_dll.c b/src/libs/fluidsynth/fluid_dll.c
+index 80f91537e..a9d7b4e8a 100644
+--- a/src/libs/fluidsynth/fluid_dll.c
++++ b/src/libs/fluidsynth/fluid_dll.c
+@@ -20,6 +20,9 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
++/* PocketDOS: fluid_dll.c is the Windows DLL dynamic-loader; not needed for the
++ * static Emscripten build (and uses unguarded HWND/HINSTANCE), so leave it
++ * compiled out on Emscripten. */
+ #if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
+ #include "fluidsynth_priv.h"
+ #include "fluid_sys.h"
+diff --git a/src/libs/fluidsynth/fluid_dsound.c b/src/libs/fluidsynth/fluid_dsound.c
+index 37bfae929..f379fab77 100644
+--- a/src/libs/fluidsynth/fluid_dsound.c
++++ b/src/libs/fluidsynth/fluid_dsound.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS) && !defined(_WIN32_WINDOWS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS) && !defined(_WIN32_WINDOWS))
+ #include "fluid_synth.h"
+ #include "fluid_adriver.h"
+ #include "fluid_settings.h"
+diff --git a/src/libs/fluidsynth/fluid_event.c b/src/libs/fluidsynth/fluid_event.c
+index 3df290bb6..d360c995e 100644
+--- a/src/libs/fluidsynth/fluid_event.c
++++ b/src/libs/fluidsynth/fluid_event.c
+@@ -29,7 +29,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_event_priv.h"
+ #include "fluidsynth_priv.h"
+ 
+diff --git a/src/libs/fluidsynth/fluid_filerenderer.c b/src/libs/fluidsynth/fluid_filerenderer.c
+index c3b0176e9..463868da6 100644
+--- a/src/libs/fluidsynth/fluid_filerenderer.c
++++ b/src/libs/fluidsynth/fluid_filerenderer.c
+@@ -24,7 +24,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include <stdio.h>
+ #include "fluidsynth_priv.h"
+ #include "fluid_synth.h"
+diff --git a/src/libs/fluidsynth/fluid_gen.c b/src/libs/fluidsynth/fluid_gen.c
+index a33577086..78290df18 100644
+--- a/src/libs/fluidsynth/fluid_gen.c
++++ b/src/libs/fluidsynth/fluid_gen.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_gen.h"
+ #include "fluid_chan.h"
+ 
+diff --git a/src/libs/fluidsynth/fluid_hash.c b/src/libs/fluidsynth/fluid_hash.c
+index 2d8ef2c91..df65e2377 100644
+--- a/src/libs/fluidsynth/fluid_hash.c
++++ b/src/libs/fluidsynth/fluid_hash.c
+@@ -33,7 +33,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluidsynth_priv.h"
+ #include "fluid_hash.h"
+ #include "fluid_list.h"
+diff --git a/src/libs/fluidsynth/fluid_iir_filter.c b/src/libs/fluidsynth/fluid_iir_filter.c
+index a2d975cbb..db7052240 100644
+--- a/src/libs/fluidsynth/fluid_iir_filter.c
++++ b/src/libs/fluidsynth/fluid_iir_filter.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_iir_filter.h"
+ #include "fluid_sys.h"
+ #include "fluid_conv.h"
+diff --git a/src/libs/fluidsynth/fluid_lfo.c b/src/libs/fluidsynth/fluid_lfo.c
+index c67a0142c..64411fb8c 100644
+--- a/src/libs/fluidsynth/fluid_lfo.c
++++ b/src/libs/fluidsynth/fluid_lfo.c
+@@ -1,6 +1,6 @@
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_lfo.h"
+ 
+ void
+diff --git a/src/libs/fluidsynth/fluid_list.c b/src/libs/fluidsynth/fluid_list.c
+index 4dbba477c..8a026311c 100644
+--- a/src/libs/fluidsynth/fluid_list.c
++++ b/src/libs/fluidsynth/fluid_list.c
+@@ -26,7 +26,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_list.h"
+ 
+ fluid_list_t*
+diff --git a/src/libs/fluidsynth/fluid_mdriver.c b/src/libs/fluidsynth/fluid_mdriver.c
+index 188debf5c..41f955b03 100644
+--- a/src/libs/fluidsynth/fluid_mdriver.c
++++ b/src/libs/fluidsynth/fluid_mdriver.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_mdriver.h"
+ #include "fluid_settings.h"
+ 
+diff --git a/src/libs/fluidsynth/fluid_midi.c b/src/libs/fluidsynth/fluid_midi.c
+index cd720e4fc..56ee9f094 100644
+--- a/src/libs/fluidsynth/fluid_midi.c
++++ b/src/libs/fluidsynth/fluid_midi.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_midi.h"
+ #include "fluid_sys.h"
+ #include "fluid_synth.h"
+diff --git a/src/libs/fluidsynth/fluid_midi_router.c b/src/libs/fluidsynth/fluid_midi_router.c
+index d9e248cb6..9c748d5af 100644
+--- a/src/libs/fluidsynth/fluid_midi_router.c
++++ b/src/libs/fluidsynth/fluid_midi_router.c
+@@ -26,7 +26,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_midi_router.h"
+ #include "fluid_midi.h"
+ #include "fluid_synth.h"
+diff --git a/src/libs/fluidsynth/fluid_mod.c b/src/libs/fluidsynth/fluid_mod.c
+index 2518ed661..1eb7eb1fb 100644
+--- a/src/libs/fluidsynth/fluid_mod.c
++++ b/src/libs/fluidsynth/fluid_mod.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_mod.h"
+ #include "fluid_chan.h"
+ #include "fluid_voice.h"
+diff --git a/src/libs/fluidsynth/fluid_ramsfont.c b/src/libs/fluidsynth/fluid_ramsfont.c
+index a5dab4085..1fa8c3cfa 100644
+--- a/src/libs/fluidsynth/fluid_ramsfont.c
++++ b/src/libs/fluidsynth/fluid_ramsfont.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_ramsfont.h"
+ #include "fluid_sys.h"
+ #include "fluid_synth.h"
+diff --git a/src/libs/fluidsynth/fluid_rev.c b/src/libs/fluidsynth/fluid_rev.c
+index 318c57e12..7591b5a35 100644
+--- a/src/libs/fluidsynth/fluid_rev.c
++++ b/src/libs/fluidsynth/fluid_rev.c
+@@ -11,7 +11,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_rev.h"
+ 
+ /***************************************************************
+diff --git a/src/libs/fluidsynth/fluid_ringbuffer.c b/src/libs/fluidsynth/fluid_ringbuffer.c
+index 2c4d9736f..d8b6ba2ba 100644
+--- a/src/libs/fluidsynth/fluid_ringbuffer.c
++++ b/src/libs/fluidsynth/fluid_ringbuffer.c
+@@ -25,7 +25,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_ringbuffer.h"
+ #include "fluidsynth_priv.h"
+ 
+diff --git a/src/libs/fluidsynth/fluid_rvoice.c b/src/libs/fluidsynth/fluid_rvoice.c
+index a0d25afdc..4462a7ccd 100644
+--- a/src/libs/fluidsynth/fluid_rvoice.c
++++ b/src/libs/fluidsynth/fluid_rvoice.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_rvoice.h"
+ #include "fluid_conv.h"
+ #include "fluid_sys.h"
+diff --git a/src/libs/fluidsynth/fluid_rvoice_dsp.c b/src/libs/fluidsynth/fluid_rvoice_dsp.c
+index 1291262ca..f1e25dcac 100644
+--- a/src/libs/fluidsynth/fluid_rvoice_dsp.c
++++ b/src/libs/fluidsynth/fluid_rvoice_dsp.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluidsynth_priv.h"
+ #include "fluid_phase.h"
+ #include "fluid_rvoice.h"
+diff --git a/src/libs/fluidsynth/fluid_rvoice_event.c b/src/libs/fluidsynth/fluid_rvoice_event.c
+index 7121def67..8f27ccc2d 100644
+--- a/src/libs/fluidsynth/fluid_rvoice_event.c
++++ b/src/libs/fluidsynth/fluid_rvoice_event.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_rvoice_event.h"
+ #include "fluid_rvoice.h"
+ #include "fluid_rvoice_mixer.h"
+diff --git a/src/libs/fluidsynth/fluid_rvoice_mixer.c b/src/libs/fluidsynth/fluid_rvoice_mixer.c
+index 613675d05..202f96191 100644
+--- a/src/libs/fluidsynth/fluid_rvoice_mixer.c
++++ b/src/libs/fluidsynth/fluid_rvoice_mixer.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_rvoice_mixer.h"
+ #include "fluid_rvoice.h"
+ #include "fluid_sys.h"
+diff --git a/src/libs/fluidsynth/fluid_sdl2.c b/src/libs/fluidsynth/fluid_sdl2.c
+index 9b11b4ff0..3a7b7c773 100644
+--- a/src/libs/fluidsynth/fluid_sdl2.c
++++ b/src/libs/fluidsynth/fluid_sdl2.c
+@@ -1,256 +1,256 @@
+-/* FluidSynth - A Software Synthesizer
+- *
+- * Copyright (C) 2003  Peter Hanappe and others.
+- * Copyright (C) 2018  Carlo Bramini
+- *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public License
+- * as published by the Free Software Foundation; either version 2.1 of
+- * the License, or (at your option) any later version.
+- *
+- * This library is distributed in the hope that it will be useful, but
+- * WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free
+- * Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+- * 02110-1301, USA
+- */
+-
+-#define FLUIDINC
+-#include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
+-#include "fluid_synth.h"
+-#include "fluid_adriver.h"
+-#include "fluid_settings.h"
+-
+-#if defined(C_SDL2)
+-
+-#include "SDL.h"
+-
+-typedef struct
+-{
+-    fluid_audio_driver_t driver;
+-
+-    fluid_synth_t *synth;
+-    fluid_audio_callback_t write_ptr;
+-
+-    SDL_AudioDeviceID devid;
+-
+-    int frame_size;
+-
+-} fluid_sdl2_audio_driver_t;
+-int delete_fluid_sdl2_audio_driver(fluid_audio_driver_t* d);
+-
+-static void
+-SDLAudioCallback(void *data, void *stream, int len)
+-{
+-    fluid_sdl2_audio_driver_t *dev = (fluid_sdl2_audio_driver_t *)data;
+-
+-    len /= dev->frame_size;
+-
+-    dev->write_ptr(dev->synth, len, stream, 0, 2, stream, 1, 2);
+-}
+-
+-void fluid_sdl2_audio_driver_settings(fluid_settings_t *settings)
+-{
+-    int n, nDevs;
+-
+-    fluid_settings_register_str(settings, "audio.sdl2.device", "default", 0,NULL,NULL);
+-    fluid_settings_add_option(settings, "audio.sdl2.device", "default");
+-
+-    if(!SDL_WasInit(SDL_INIT_AUDIO))
+-    {
+-        FLUID_LOG(FLUID_ERR, "SDL2 not initialized");
+-        return;
+-    }
+-
+-    nDevs = SDL_GetNumAudioDevices(0);
+-
+-    for(n = 0; n < nDevs; n++)
+-    {
+-        const char *dev_name = SDL_GetAudioDeviceName(n, 0);
+-
+-        if(dev_name != NULL)
+-        {
+-            FLUID_LOG(FLUID_DBG, "SDL2 driver testing audio device: %s", dev_name);
+-            fluid_settings_add_option(settings, "audio.sdl2.device", dev_name);
+-        }
+-    }
+-}
+-
+-
+-/*
+- * new_fluid_sdl2_audio_driver
+- */
+-fluid_audio_driver_t *
+-new_fluid_sdl2_audio_driver(fluid_settings_t *settings, fluid_synth_t *synth)
+-{
+-    fluid_sdl2_audio_driver_t *dev = NULL;
+-    fluid_audio_callback_t write_ptr;
+-    double sample_rate;
+-    int period_size, sample_size;
+-    SDL_AudioSpec aspec, rspec;
+-    char *device;
+-    const char *dev_name;
+-
+-    /* Check if SDL library has been started */
+-    if(!SDL_WasInit(SDL_INIT_AUDIO))
+-    {
+-        FLUID_LOG(FLUID_ERR, "Failed to create SDL2 audio driver, because the audio subsystem of SDL2 is not initialized.");
+-        return NULL;
+-    }
+-
+-    /* Retrieve the settings */
+-    fluid_settings_getnum(settings, "synth.sample-rate", &sample_rate);
+-    fluid_settings_getint(settings, "audio.period-size", &period_size);
+-
+-    /* Lower values do not seem to give good results */
+-    if(period_size < 1024)
+-    {
+-        period_size = 1024;
+-    }
+-    else
+-    {
+-        /* According to documentation, it MUST be a power of two */
+-        if((period_size & (period_size - 1)) != 0)
+-        {
+-            FLUID_LOG(FLUID_ERR, "\"audio.period-size\" must be a power of 2 for SDL2");
+-            return NULL;
+-        }
+-    }
+-    /* Clear the format buffer */
+-    FLUID_MEMSET(&aspec, 0, sizeof(aspec));
+-
+-    /* Setup mixing frequency */
+-    aspec.freq = (int)sample_rate;
+-
+-    /* Check the format */
+-    if(fluid_settings_str_equal(settings, "audio.sample-format", "float"))
+-    {
+-        FLUID_LOG(FLUID_DBG, "Selected 32 bit sample format");
+-
+-        sample_size = sizeof(float);
+-        write_ptr   = fluid_synth_write_float;
+-
+-        aspec.format = AUDIO_F32SYS;
+-    }
+-    else if(fluid_settings_str_equal(settings, "audio.sample-format", "16bits"))
+-    {
+-        FLUID_LOG(FLUID_DBG, "Selected 16 bit sample format");
+-
+-        sample_size = sizeof(short);
+-        write_ptr   = fluid_synth_write_s16;
+-
+-        aspec.format = AUDIO_S16SYS;
+-    }
+-    else
+-    {
+-        FLUID_LOG(FLUID_ERR, "Unhandled sample format");
+-        return NULL;
+-    }
+-
+-    /* Compile the format buffer */
+-    aspec.channels   = 2;
+-    aspec.samples    = aspec.channels * ((period_size + 7) & ~7);
+-    aspec.callback   = (SDL_AudioCallback)SDLAudioCallback;
+-
+-    /* Set default device to use */
+-    device   = NULL;
+-    dev_name = NULL;
+-
+-    /* get the selected device name. if none is specified, use default device. */
+-    if(fluid_settings_dupstr(settings, "audio.sdl2.device", &device) == FLUID_OK
+-            && device != NULL && device[0] != '\0')
+-    {
+-        int n, nDevs = SDL_GetNumAudioDevices(0);
+-
+-        for(n = 0; n < nDevs; n++)
+-        {
+-            dev_name = SDL_GetAudioDeviceName(n, 0);
+-
+-            if(FLUID_STRCASECMP(dev_name, device) == 0)
+-            {
+-                FLUID_LOG(FLUID_DBG, "Selected audio device GUID: %s", dev_name);
+-                break;
+-            }
+-        }
+-
+-        if(n >= nDevs)
+-        {
+-            FLUID_LOG(FLUID_DBG, "Audio device %s, using \"default\"", device);
+-            dev_name = NULL;
+-        }
+-    }
+-
+-    if(device != NULL)
+-    {
+-        FLUID_FREE(device);
+-    }
+-
+-    do
+-    {
+-        /* create and clear the driver data */
+-        dev = FLUID_NEW(fluid_sdl2_audio_driver_t);
+-
+-        if(dev == NULL)
+-        {
+-            FLUID_LOG(FLUID_ERR, "Out of memory");
+-            break;
+-        }
+-
+-        FLUID_MEMSET(dev, 0, sizeof(fluid_sdl2_audio_driver_t));
+-
+-        /* set device pointer to userdata */
+-        aspec.userdata = dev;
+-
+-        /* Save copy of synth */
+-        dev->synth = synth;
+-
+-        /* Save copy of other variables */
+-        dev->write_ptr = write_ptr;
+-        dev->frame_size = sample_size * aspec.channels;
+-
+-        /* Open audio device */
+-        dev->devid = SDL_OpenAudioDevice(dev_name, 0, &aspec, &rspec, 0);
+-
+-        if(!dev->devid)
+-        {
+-            FLUID_LOG(FLUID_ERR, "Failed to open audio device");
+-            break;
+-        }
+-
+-        /* Start to play */
+-        SDL_PauseAudioDevice(dev->devid, 0);
+-
+-        return (fluid_audio_driver_t *) dev;
+-    }
+-    while(0);
+-
+-    int rt=delete_fluid_sdl2_audio_driver(&dev->driver);
+-    return NULL;
+-}
+-
+-
+-int delete_fluid_sdl2_audio_driver(fluid_audio_driver_t *d)
+-{
+-    fluid_sdl2_audio_driver_t *dev = (fluid_sdl2_audio_driver_t *) d;
+-
+-    if(dev != NULL)
+-    {
+-        if(dev->devid)
+-        {
+-            /* Stop audio and close */
+-            SDL_PauseAudioDevice(dev->devid, 1);
+-            SDL_CloseAudioDevice(dev->devid);
+-        }
+-
+-        FLUID_FREE(dev);
+-    }
+-	return 0;
+-}
+-
+-#endif /* SDL2_SUPPORT */
++/* FluidSynth - A Software Synthesizer
++ *
++ * Copyright (C) 2003  Peter Hanappe and others.
++ * Copyright (C) 2018  Carlo Bramini
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free
++ * Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA
++ */
++
++#define FLUIDINC
++#include "config.h"
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
++#include "fluid_synth.h"
++#include "fluid_adriver.h"
++#include "fluid_settings.h"
++
++#if defined(C_SDL2)
++
++#include "SDL.h"
++
++typedef struct
++{
++    fluid_audio_driver_t driver;
++
++    fluid_synth_t *synth;
++    fluid_audio_callback_t write_ptr;
++
++    SDL_AudioDeviceID devid;
++
++    int frame_size;
++
++} fluid_sdl2_audio_driver_t;
++int delete_fluid_sdl2_audio_driver(fluid_audio_driver_t* d);
++
++static void
++SDLAudioCallback(void *data, void *stream, int len)
++{
++    fluid_sdl2_audio_driver_t *dev = (fluid_sdl2_audio_driver_t *)data;
++
++    len /= dev->frame_size;
++
++    dev->write_ptr(dev->synth, len, stream, 0, 2, stream, 1, 2);
++}
++
++void fluid_sdl2_audio_driver_settings(fluid_settings_t *settings)
++{
++    int n, nDevs;
++
++    fluid_settings_register_str(settings, "audio.sdl2.device", "default", 0,NULL,NULL);
++    fluid_settings_add_option(settings, "audio.sdl2.device", "default");
++
++    if(!SDL_WasInit(SDL_INIT_AUDIO))
++    {
++        FLUID_LOG(FLUID_ERR, "SDL2 not initialized");
++        return;
++    }
++
++    nDevs = SDL_GetNumAudioDevices(0);
++
++    for(n = 0; n < nDevs; n++)
++    {
++        const char *dev_name = SDL_GetAudioDeviceName(n, 0);
++
++        if(dev_name != NULL)
++        {
++            FLUID_LOG(FLUID_DBG, "SDL2 driver testing audio device: %s", dev_name);
++            fluid_settings_add_option(settings, "audio.sdl2.device", dev_name);
++        }
++    }
++}
++
++
++/*
++ * new_fluid_sdl2_audio_driver
++ */
++fluid_audio_driver_t *
++new_fluid_sdl2_audio_driver(fluid_settings_t *settings, fluid_synth_t *synth)
++{
++    fluid_sdl2_audio_driver_t *dev = NULL;
++    fluid_audio_callback_t write_ptr;
++    double sample_rate;
++    int period_size, sample_size;
++    SDL_AudioSpec aspec, rspec;
++    char *device;
++    const char *dev_name;
++
++    /* Check if SDL library has been started */
++    if(!SDL_WasInit(SDL_INIT_AUDIO))
++    {
++        FLUID_LOG(FLUID_ERR, "Failed to create SDL2 audio driver, because the audio subsystem of SDL2 is not initialized.");
++        return NULL;
++    }
++
++    /* Retrieve the settings */
++    fluid_settings_getnum(settings, "synth.sample-rate", &sample_rate);
++    fluid_settings_getint(settings, "audio.period-size", &period_size);
++
++    /* Lower values do not seem to give good results */
++    if(period_size < 1024)
++    {
++        period_size = 1024;
++    }
++    else
++    {
++        /* According to documentation, it MUST be a power of two */
++        if((period_size & (period_size - 1)) != 0)
++        {
++            FLUID_LOG(FLUID_ERR, "\"audio.period-size\" must be a power of 2 for SDL2");
++            return NULL;
++        }
++    }
++    /* Clear the format buffer */
++    FLUID_MEMSET(&aspec, 0, sizeof(aspec));
++
++    /* Setup mixing frequency */
++    aspec.freq = (int)sample_rate;
++
++    /* Check the format */
++    if(fluid_settings_str_equal(settings, "audio.sample-format", "float"))
++    {
++        FLUID_LOG(FLUID_DBG, "Selected 32 bit sample format");
++
++        sample_size = sizeof(float);
++        write_ptr   = fluid_synth_write_float;
++
++        aspec.format = AUDIO_F32SYS;
++    }
++    else if(fluid_settings_str_equal(settings, "audio.sample-format", "16bits"))
++    {
++        FLUID_LOG(FLUID_DBG, "Selected 16 bit sample format");
++
++        sample_size = sizeof(short);
++        write_ptr   = fluid_synth_write_s16;
++
++        aspec.format = AUDIO_S16SYS;
++    }
++    else
++    {
++        FLUID_LOG(FLUID_ERR, "Unhandled sample format");
++        return NULL;
++    }
++
++    /* Compile the format buffer */
++    aspec.channels   = 2;
++    aspec.samples    = aspec.channels * ((period_size + 7) & ~7);
++    aspec.callback   = (SDL_AudioCallback)SDLAudioCallback;
++
++    /* Set default device to use */
++    device   = NULL;
++    dev_name = NULL;
++
++    /* get the selected device name. if none is specified, use default device. */
++    if(fluid_settings_dupstr(settings, "audio.sdl2.device", &device) == FLUID_OK
++            && device != NULL && device[0] != '\0')
++    {
++        int n, nDevs = SDL_GetNumAudioDevices(0);
++
++        for(n = 0; n < nDevs; n++)
++        {
++            dev_name = SDL_GetAudioDeviceName(n, 0);
++
++            if(FLUID_STRCASECMP(dev_name, device) == 0)
++            {
++                FLUID_LOG(FLUID_DBG, "Selected audio device GUID: %s", dev_name);
++                break;
++            }
++        }
++
++        if(n >= nDevs)
++        {
++            FLUID_LOG(FLUID_DBG, "Audio device %s, using \"default\"", device);
++            dev_name = NULL;
++        }
++    }
++
++    if(device != NULL)
++    {
++        FLUID_FREE(device);
++    }
++
++    do
++    {
++        /* create and clear the driver data */
++        dev = FLUID_NEW(fluid_sdl2_audio_driver_t);
++
++        if(dev == NULL)
++        {
++            FLUID_LOG(FLUID_ERR, "Out of memory");
++            break;
++        }
++
++        FLUID_MEMSET(dev, 0, sizeof(fluid_sdl2_audio_driver_t));
++
++        /* set device pointer to userdata */
++        aspec.userdata = dev;
++
++        /* Save copy of synth */
++        dev->synth = synth;
++
++        /* Save copy of other variables */
++        dev->write_ptr = write_ptr;
++        dev->frame_size = sample_size * aspec.channels;
++
++        /* Open audio device */
++        dev->devid = SDL_OpenAudioDevice(dev_name, 0, &aspec, &rspec, 0);
++
++        if(!dev->devid)
++        {
++            FLUID_LOG(FLUID_ERR, "Failed to open audio device");
++            break;
++        }
++
++        /* Start to play */
++        SDL_PauseAudioDevice(dev->devid, 0);
++
++        return (fluid_audio_driver_t *) dev;
++    }
++    while(0);
++
++    int rt=delete_fluid_sdl2_audio_driver(&dev->driver);
++    return NULL;
++}
++
++
++int delete_fluid_sdl2_audio_driver(fluid_audio_driver_t *d)
++{
++    fluid_sdl2_audio_driver_t *dev = (fluid_sdl2_audio_driver_t *) d;
++
++    if(dev != NULL)
++    {
++        if(dev->devid)
++        {
++            /* Stop audio and close */
++            SDL_PauseAudioDevice(dev->devid, 1);
++            SDL_CloseAudioDevice(dev->devid);
++        }
++
++        FLUID_FREE(dev);
++    }
++	return 0;
++}
++
++#endif /* SDL2_SUPPORT */
+ #endif
+\ No newline at end of file
+diff --git a/src/libs/fluidsynth/fluid_seq.c b/src/libs/fluidsynth/fluid_seq.c
+index 956ecc4df..cf85de9a7 100644
+--- a/src/libs/fluidsynth/fluid_seq.c
++++ b/src/libs/fluidsynth/fluid_seq.c
+@@ -29,7 +29,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_event_priv.h"
+ #include "fluidsynth_priv.h"	// FLUID_NEW, etc
+ #include "fluid_sys.h"	// timer, threads, etc...
+diff --git a/src/libs/fluidsynth/fluid_seqbind.c b/src/libs/fluidsynth/fluid_seqbind.c
+index 476d8d5b5..d793ee83d 100644
+--- a/src/libs/fluidsynth/fluid_seqbind.c
++++ b/src/libs/fluidsynth/fluid_seqbind.c
+@@ -29,7 +29,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluidsynth_priv.h"
+ #include "fluid_synth.h"
+ #include "fluid_midi.h"
+diff --git a/src/libs/fluidsynth/fluid_settings.c b/src/libs/fluidsynth/fluid_settings.c
+index d859e6907..a635ae111 100644
+--- a/src/libs/fluidsynth/fluid_settings.c
++++ b/src/libs/fluidsynth/fluid_settings.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluidsynth_priv.h"
+ #include "fluid_sys.h"
+ #include "fluid_hash.h"
+diff --git a/src/libs/fluidsynth/fluid_synth.c b/src/libs/fluidsynth/fluid_synth.c
+index abca3ad91..a5d70bbda 100644
+--- a/src/libs/fluidsynth/fluid_synth.c
++++ b/src/libs/fluidsynth/fluid_synth.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include <math.h>
+ 
+ #include "fluid_synth.h"
+diff --git a/src/libs/fluidsynth/fluid_sys.c b/src/libs/fluidsynth/fluid_sys.c
+index d247bb1d5..4cdc3204d 100644
+--- a/src/libs/fluidsynth/fluid_sys.c
++++ b/src/libs/fluidsynth/fluid_sys.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS) && !defined(_WIN32_WINDOWS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS) && !defined(_WIN32_WINDOWS))
+ #include "fluid_sys.h"
+ 
+ #if defined(WIN32)
+diff --git a/src/libs/fluidsynth/fluid_sys.h b/src/libs/fluidsynth/fluid_sys.h
+index 30d1760cb..9ee1d38e6 100644
+--- a/src/libs/fluidsynth/fluid_sys.h
++++ b/src/libs/fluidsynth/fluid_sys.h
+@@ -70,7 +70,13 @@ void fluid_time_config(void);
+         } \
+     } FLUID_STMT_END
+ #define fluid_return_if_fail(expr)      fluid_return_val_if_fail(expr,)
++#if defined(__EMSCRIPTEN__)
++/* PocketDOS: bare C99 `inline` leaves no out-of-line copy under -Oz (e.g.
++ * get_timespec), causing undefined symbols. `static inline` emits a per-TU copy. */
++#define FLUID_INLINE                    static inline
++#else
+ #define FLUID_INLINE                    inline
++#endif
+ #define FLUID_POINTER_TO_UINT(expr)     ((unsigned int) (uintptr_t) (expr))
+ #define FLUID_UINT_TO_POINTER(expr)     ((void*) (uintptr_t) (expr))
+ #define FLUID_POINTER_TO_INT(expr)      ((int) (intptr_t) (expr))
+diff --git a/src/libs/fluidsynth/fluid_tuning.c b/src/libs/fluidsynth/fluid_tuning.c
+index 74c710981..aef8da0fa 100644
+--- a/src/libs/fluidsynth/fluid_tuning.c
++++ b/src/libs/fluidsynth/fluid_tuning.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluid_tuning.h"
+ #include "fluidsynth_priv.h"
+ #include "fluid_sys.h"
+diff --git a/src/libs/fluidsynth/fluid_voice.c b/src/libs/fluidsynth/fluid_voice.c
+index d46f0d547..fbc49cf50 100644
+--- a/src/libs/fluidsynth/fluid_voice.c
++++ b/src/libs/fluidsynth/fluid_voice.c
+@@ -20,7 +20,7 @@
+ 
+ #define FLUIDINC
+ #include "config.h"
+-#if !C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS)
++#if defined(__EMSCRIPTEN__) || (!C_FLUIDSYNTH && defined(WIN32) && !defined(C_HX_DOS))
+ #include "fluidsynth_priv.h"
+ #include "fluid_voice.h"
+ #include "fluid_mod.h"
+diff --git a/src/libs/fluidsynth/fluidsynth_priv.h b/src/libs/fluidsynth/fluidsynth_priv.h
+index 10497e0f0..9cf224100 100644
+--- a/src/libs/fluidsynth/fluidsynth_priv.h
++++ b/src/libs/fluidsynth/fluidsynth_priv.h
+@@ -22,7 +22,9 @@
+ #ifndef _FLUIDSYNTH_PRIV_H
+ #define _FLUIDSYNTH_PRIV_H
+ 
+-#if HAVE_CONFIG_H || defined(WIN32)
++#if defined(__EMSCRIPTEN__)
++#include "fluidsynth/config_emscripten.h"
++#elif HAVE_CONFIG_H || defined(WIN32)
+ #include "fluidsynth/config_win32.h"
+ #endif
+ 

@@ -22,18 +22,37 @@ struct ConfigEditorView: View {
         NavigationStack {
             Form {
                 Section {
-                    Text("These lines are appended to the game's dosbox.conf at launch and override it. Common audio fix: set the Sound Blaster IRQ to match the game (try the other value if sound cuts out after a moment).")
+                    Text("These lines are appended to the game's dosbox.conf at launch and override it.\n\nMusic: tap “General MIDI” for rich SoundFont music — best for adventure/RPG games that offer a General MIDI / MPU-401 / Roland option in their setup. Or use AdLib / Sound Blaster for FM music; “Force FM music” hides the MIDI port so auto-detecting games fall back to FM.\n\nIf in-game sound cuts out after a moment, try the other Sound Blaster IRQ.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Quick fixes") {
+                Section("Sound Blaster IRQ") {
                     HStack {
                         Button("SB IRQ 5") { append("[sblaster]\nirq=5\n") }
                         Spacer()
                         Button("SB IRQ 7") { append("[sblaster]\nirq=7\n") }
+                    }
+                    .buttonStyle(.bordered)
+                    .font(.footnote)
+                }
+
+                Section("Music") {
+                    Button("Enable General MIDI (SoundFont)") {
+                        // mididevice=synth renders FluidSynth into DOSBox's own mixer
+                        // (the WASM-friendly path); the "fluidsynth" device opens a
+                        // standalone OS audio driver that doesn't exist in the browser.
+                        // midiconfig is the SoundFont path FluidSynth fopen()s on the
+                        // HOST (Emscripten MEMFS), NOT a DOS C:\ path — the bundle is
+                        // unpacked to /home/web_user, so that's where the injected .sf2 lives.
+                        append("[midi]\nmpu401=intelligent\nmididevice=synth\nmidiconfig=/home/web_user/TIMGM6MB.SF2\n")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.footnote)
+                    HStack {
+                        Button("Force FM music") { append("[midi]\nmpu401=none\n") }
                         Spacer()
-                        Button("AdLib only") { append("[sblaster]\nsbtype=none\noplmode=auto\n") }
+                        Button("FM only (mute digital)") { append("[sblaster]\nsbtype=none\noplmode=auto\n") }
                     }
                     .buttonStyle(.bordered)
                     .font(.footnote)

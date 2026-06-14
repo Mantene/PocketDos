@@ -1,0 +1,69 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6f3ad9e..bcd93ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -16,7 +16,10 @@ set(TARGETS_DIR "${CMAKE_CURRENT_LIST_DIR}/targets")
+ 
+ # add_compile_options(-fno-exceptions)
+ 
+-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -Werror=return-type -fsigned-char")
++# PocketDOS: clang 16+ (Emscripten 6.0) promotes several legacy-C diagnostics to
++# hard errors that the bundled DOSBox-X libs (speexdsp, etc.) trip; the project's
++# `-w` doesn't suppress default-errors, so demote them back to warnings.
++set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -Werror=return-type -fsigned-char -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=int-conversion -Wno-error=implicit-int -Wno-error=implicit-function-declaration")
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -Werror=return-type -fsigned-char") 
+ 
+ if ((CMAKE_BUILD_TYPE STREQUAL "Debug") OR (CMAKE_BUILD_TYPE STREQUAL ""))
+diff --git a/native/jsdos/jsdos-emscripten-stubs.c b/native/jsdos/jsdos-emscripten-stubs.c
+new file mode 100644
+index 0000000..dec9dc5
+--- /dev/null
++++ b/native/jsdos/jsdos-emscripten-stubs.c
+@@ -0,0 +1,14 @@
++/* PocketDOS: stubs for libc symbols that Emscripten's single-threaded libc
++ * declares but does not implement. FluidSynth's thread-creation path
++ * (new_fluid_thread) references pthread_attr_setschedpolicy to request
++ * SCHED_FIFO priority; that thread path is never actually used in this
++ * single-threaded WASM build, but the reference must still resolve at link. */
++#if defined(__EMSCRIPTEN__)
++#include <pthread.h>
++
++int pthread_attr_setschedpolicy(pthread_attr_t *attr, int policy) {
++    (void)attr;
++    (void)policy;
++    return 0;
++}
++#endif
+diff --git a/targets/dosbox-x-sdl2.cmake b/targets/dosbox-x-sdl2.cmake
+index b5e751e..65c159b 100644
+--- a/targets/dosbox-x-sdl2.cmake
++++ b/targets/dosbox-x-sdl2.cmake
+@@ -660,7 +660,8 @@ add_library(libdosbox-x-jsdos OBJECT ${SOURCES_X_SDL} ${SOURCES_X_CORE} ${SOURCE
+         ${SOURCES_X_JSDOS_MAIN})
+ target_compile_definitions(libdosbox-x-jsdos
+         PUBLIC ${DEFINITIONS_CORE_X}
+-        PUBLIC "-DJSDOS_X")
++        PUBLIC "-DJSDOS_X"
++        PUBLIC "-DC_FLUIDSYNTH=1")
+ set_property(TARGET libdosbox-x-jsdos PROPERTY CXX_STANDARD 11)
+ 
+ set(DOSBOX_X_INCLUDE_DIRECTORIES
+@@ -709,7 +710,8 @@ if (${EMSCRIPTEN})
+             )
+ 
+     target_compile_options(libdosbox-x-jsdos PUBLIC -fwasm-exceptions)
+-    add_executable(wdosbox-x "${SRC_DIR}/dos/dosbox/cpp/worker-protocol.cpp")
++    add_executable(wdosbox-x "${SRC_DIR}/dos/dosbox/cpp/worker-protocol.cpp"
++            "${NATIVE_DIR}/jsdos/jsdos-emscripten-stubs.c")
+     set_target_properties(wdosbox-x PROPERTIES SUFFIX .js)
+     target_link_libraries(wdosbox-x libdosbox-x-jsdos libzip)
+     # TODO: set sERROR_ON_UNDEFINED_SYMBOLS=1
+@@ -723,7 +725,7 @@ if (${EMSCRIPTEN})
+         #     "-sSAFE_HEAP=2"
+             "-sASYNCIFY=1"
+             "-sASYNCIFY_IMPORTS=['syncSleep']"
+-            "-sASYNCIFY_WHITELIST=@${TARGETS_DIR}/dosbox-x-asyncify.txt"
++            "-sASYNCIFY_ONLY=@${TARGETS_DIR}/dosbox-x-asyncify.txt"
+         #     "-sASYNCIFY_STACK_SIZE=16384"
+             "-sEXPORT_NAME='WDOSBOXX'"
+             "-sERROR_ON_UNDEFINED_SYMBOLS=1")

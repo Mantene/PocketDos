@@ -184,6 +184,12 @@
         log("converting zip → bundle…");
         const bundle = await emulators.bundle();
         bundle.extract(url);              // default: path "/", type "zip"
+        // General MIDI: if this game requests the synth device / a .sf2, merge the
+        // bundled SoundFont into the bundle root → mounts as C:\TIMGM6MB.SF2 (via `mount c .`).
+        if (wantsGeneralMidi(confOverride)) {
+          log("adding General MIDI soundfont…");
+          bundle.extract(new URL("soundfont.zip", location.href).href);
+        }
         // Auto-run a chosen executable: append to [autoexec] (which already does
         // `mount c .` + `c:`) so it runs after the drive is mounted.
         if (runCmd) {
@@ -222,7 +228,14 @@
     // chance the custom-scheme load works; flip these to test performance.
     const USE_WORKER = false;        // true => dosboxWorker (off-main-thread)
     const USE_OFFSCREEN = false;     // requires USE_WORKER = true
-    const BACKEND = "dosbox";        // js-dos auto-switches to dosboxX for Win9x configs
+    // Games that request General MIDI (mididevice=synth + a .sf2 in their config)
+    // run on the dosbox-x backend, whose rebuilt wdosbox-x.wasm has FluidSynth
+    // compiled in. Everything else stays on the lighter plain dosbox. Win9x still
+    // auto-switches.
+    const _confParam = new URLSearchParams(location.search).get("conf") || "";
+    const wantsGeneralMidi = (conf) =>
+      /mididevice\s*=\s*\w*synth/i.test(conf || "") || /\.sf2\b/i.test(conf || "");
+    const BACKEND = wantsGeneralMidi(_confParam) ? "dosboxX" : "dosbox";
     const GAME_URL = "games/game.jsdos"; // drop a .jsdos here to autostart
     // -----------------------------------------------------------------------
 
