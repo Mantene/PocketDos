@@ -30,6 +30,7 @@ struct EmulatorWebView: UIViewRepresentable {
         webView.backgroundColor = .black
         webView.isOpaque = false
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator   // catch target="_blank" / window.open
 
         webView.load(URLRequest(url: BundleSchemeHandler.startURL))
         return webView
@@ -37,7 +38,7 @@ struct EmulatorWebView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
         func userContentController(_ controller: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
             if message.name == "console" {
@@ -48,6 +49,29 @@ struct EmulatorWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
                      withError error: Error) {
             print("[web] navigation failed: \(error.localizedDescription)")
+        }
+
+        // WKWebView drops target="_blank" / window.open unless we handle it here.
+        // js-dos's "Disk images (sockdrive)" quick-links are _blank anchors, so
+        // without this they silently do nothing. We route .jsdos links back through
+        // our harness loader (?url=) so js-dos actually loads the bundle; other
+        // links load in place.
+        func webView(_ webView: WKWebView,
+                     createWebViewWith configuration: WKWebViewConfiguration,
+                     for navigationAction: WKNavigationAction,
+                     windowFeatures: WKWindowFeatures) -> WKWebView? {
+            guard let url = navigationAction.request.url else { return nil }
+            print("[web] intercepted _blank navigation: \(url.absoluteString)")
+            if url.absoluteString.contains(".jsdos") {
+                let encoded = url.absoluteString
+                    .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                if let harness = URL(string: BundleSchemeHandler.startURL.absoluteString + "?url=" + encoded) {
+                    webView.load(URLRequest(url: harness))
+                }
+            } else {
+                webView.load(navigationAction.request)
+            }
+            return nil
         }
     }
 

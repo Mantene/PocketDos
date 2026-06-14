@@ -94,17 +94,26 @@
       window.props = Dos(document.getElementById("app"), options);
     }
 
-    // Autostart a bundled game if present; otherwise load the js-dos UI so we
-    // can still confirm the engine boots and import a game via the UI.
-    fetch(GAME_URL, { method: "HEAD" })
-      .then((r) => {
-        if (r.ok) { log("loading " + GAME_URL + " …"); startDos(GAME_URL); }
-        else { log("No bundled game.\nAdd Web/games/game.jsdos and rebuild.\nLoading js-dos UI…"); startDos(null); }
-      })
-      .catch(() => {
-        log("No bundled game.\nAdd Web/games/game.jsdos and rebuild.\nLoading js-dos UI…");
-        startDos(null);
-      });
+    // A ?url= param (set by the native WKUIDelegate when a sockdrive/_blank
+    // quick-link is tapped, or for "load by url") takes priority.
+    const PARAM_URL = new URLSearchParams(location.search).get("url");
+
+    if (PARAM_URL) {
+      log("loading " + PARAM_URL + " …");
+      startDos(PARAM_URL);
+    } else {
+      // Autostart a bundled game if present; otherwise load the js-dos UI so we
+      // can still confirm the engine boots and import a game via the UI.
+      fetch(GAME_URL, { method: "HEAD" })
+        .then((r) => {
+          if (r.ok) { log("loading " + GAME_URL + " …"); startDos(GAME_URL); }
+          else { log("No bundled game.\nAdd Web/games/game.jsdos and rebuild.\nLoading js-dos UI…"); startDos(null); }
+        })
+        .catch(() => {
+          log("No bundled game.\nAdd Web/games/game.jsdos and rebuild.\nLoading js-dos UI…");
+          startDos(null);
+        });
+    }
   </script>
 </body>
 </html>
