@@ -26,3 +26,9 @@ Web/games/*
 # Backup of the stock js-dos wdosbox-x assets (kept locally before swapping in
 # the custom FluidSynth build); recoverable from js-dos, not worth committing.
 Web/emulators/.orig-backup/
+
+# Spike leftovers — copyrighted OS content (chunked Win98 drive, MS-DOS boot
+# floppy) and debug screenshots must never be committed or shipped.
+Web/drive/
+Web/writespike.zip
+/*.png
