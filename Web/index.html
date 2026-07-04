@@ -289,7 +289,15 @@
     const SHOW_FPS = !!new URLSearchParams(location.search).get("fps");
     let frames = 0, lastT = performance.now(), fps = 0, rafCum = 0;
     let emuFrames = 0, emuLastT = performance.now(), emuFps = 0, emuCum = 0;
+    // Input-activity counter: without it a low emu rate is ambiguous (an IDLE Win9x
+    // desktop legitimately outputs ~0 fps — frames push only on pixel change). The
+    // [pdos-fps] line pairs act (input events/5s window) with emu, so act>0 + emu
+    // low = genuinely chugging, act=0 + emu=0 = just idle. Capture-phase + passive
+    // so js-dos's own handlers are unaffected.
+    let actCum = 0;
     if (PDOS_DEBUG || SHOW_FPS) {
+      ["pointerdown", "pointermove", "keydown"].forEach((t) =>
+        window.addEventListener(t, () => { actCum++; }, { capture: true, passive: true }));
       (function tick() {
         frames++; rafCum++;
         const now = performance.now();
@@ -657,12 +665,13 @@
               // Hands-free record: 5s-window averages from the cumulative counters
               // (robust even when the guest pauses frame output on a static screen),
               // bridged to the native log by the console handler.
-              let lastRafCum = 0, lastEmuCum = 0;
+              let lastRafCum = 0, lastEmuCum = 0, lastActCum = 0;
               setInterval(() => {
                 const raf = (rafCum - lastRafCum) / 5, emu = (emuCum - lastEmuCum) / 5;
-                lastRafCum = rafCum; lastEmuCum = emuCum;
+                const act = actCum - lastActCum;   // raw events in the window
+                lastRafCum = rafCum; lastEmuCum = emuCum; lastActCum = actCum;
                 let res = ""; try { res = " res=" + arg.width() + "x" + arg.height(); } catch (e) {}
-                console.log("[pdos-fps] raf=" + raf.toFixed(1) + " emu=" + emu.toFixed(1) + res);
+                console.log("[pdos-fps] raf=" + raf.toFixed(1) + " emu=" + emu.toFixed(1) + " act=" + act + res);
               }, 5000);
             } else {
               hud.style.display = "none";   // hide the debug overlay during play
