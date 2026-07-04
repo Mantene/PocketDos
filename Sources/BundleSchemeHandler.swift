@@ -108,12 +108,24 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
         }
         #endif
 
-        // Bundled assets (engine wasm/js/css) are immutable per app version — let
-        // WebKit cache them so a reload (Restart / quick-load) doesn't re-fetch and
-        // re-compile the multi-MB wasm. Imported games + saves under lib/ are mutable.
-        let cache = relPath.hasPrefix("lib/")
-            ? "no-store"
-            : "public, max-age=31536000, immutable"
+        // Three cache tiers:
+        //  - lib/ (imported games + saves): mutable → never cache.
+        //  - emulators/ (multi-MB engine wasm/js): immutable per app version → long
+        //    cache so Restart / quick-load doesn't re-fetch + re-compile the wasm.
+        //  - everything else (index.html, js-dos.js, …): `no-cache` so WKWebView
+        //    re-requests it every load. This is load-bearing for DEPLOYS: with
+        //    `immutable` here, a redeploy that doesn't delete the app kept serving a
+        //    stale cached harness — three mouse-fix builds "failed" on device without
+        //    their JS ever running (the missing unconditional [pdos-mouse] log). The
+        //    handler serves from local disk, so revalidation costs ~ms for small files.
+        let cache: String
+        if relPath.hasPrefix("lib/") {
+            cache = "no-store"
+        } else if relPath.hasPrefix("emulators/") {
+            cache = "public, max-age=31536000, immutable"
+        } else {
+            cache = "no-cache"
+        }
         let headers: [String: String] = [
             "Content-Type": Self.mimeType(forPathExtension: fileURL.pathExtension),
             "Content-Length": String(data.count),

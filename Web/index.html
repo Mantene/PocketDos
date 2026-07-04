@@ -546,7 +546,13 @@
       // discards relative, and locked drops absolute, so the cursor stayed dead. The working conf wins.)
       conf = setConf(conf, "autolock", "false", "sdl");
       conf = setConf(conf, "mouse_emulation", "integration", "sdl");
-      log("[pdos-mouse] Win9x guest: autolock=false + mouse_emulation=integration (absolute mouse, matches system-win98 bundle)");
+      // ROOT CAUSE of the dead sockdrive cursor (Chrome-reproduced + fixed 2026-07-04):
+      // integration-mode needs the dosbox-x INTEGRATION DEVICE ([cpu] section) as its
+      // conduit into the guest; the js-dos default conf never emits it, and without it
+      // BOTH absolute and relative motion die (integration zeroes the deltas). The
+      // working bundle conf carries it — the [sdl] pair above is only half the mechanism.
+      conf = setConf(conf, "integration device", "true", "cpu");
+      log("[pdos-mouse] Win9x guest: autolock=false + mouse_emulation=integration + [cpu] integration device=true (absolute mouse, matches system-win98 bundle)");
       const cut = conf.search(/^\[autoexec\]/im);
       if (cut >= 0) conf = conf.slice(0, cut);
       conf += "[autoexec]\necho off\nimgmount 2 sockdrive " + base + "\nboot c:\n";
