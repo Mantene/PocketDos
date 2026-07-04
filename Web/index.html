@@ -278,11 +278,20 @@
     const GAME_URL = "games/game.jsdos"; // drop a .jsdos here to autostart
     // -----------------------------------------------------------------------
 
-    // Lightweight on-screen FPS meter (rAF cadence ~ render rate). DEBUG-only.
-    let frames = 0, lastT = performance.now(), fps = 0;
-    if (PDOS_DEBUG) {
+    // Lightweight FPS meters, on via PDOS_DEBUG or &fps=1 (native adds it in DEBUG
+    // builds). Two rates, because they answer different questions:
+    //  - rAF cadence ≈ main-thread health (the emulator runs ON the main thread
+    //    here, so guest load shows up as dropped rAF ticks);
+    //  - emu frames (ci.events().onFrame, hooked at ci-ready) = what the guest
+    //    actually outputs — the number that decides Win9x usability.
+    // The 1s-window values feed the HUD; cumulative counters feed a [pdos-fps]
+    // console line every 5s so the device log records perf hands-free.
+    const SHOW_FPS = !!new URLSearchParams(location.search).get("fps");
+    let frames = 0, lastT = performance.now(), fps = 0, rafCum = 0;
+    let emuFrames = 0, emuLastT = performance.now(), emuFps = 0, emuCum = 0;
+    if (PDOS_DEBUG || SHOW_FPS) {
       (function tick() {
-        frames++;
+        frames++; rafCum++;
         const now = performance.now();
         if (now - lastT >= 1000) { fps = frames; frames = 0; lastT = now; }
         requestAnimationFrame(tick);
@@ -630,11 +639,31 @@
             const t = sockMs();
             log("running — ci-ready" + (t !== null ? " [sockspike +" + t + "ms to ci-ready]" : ""));
             if (window.__spikeSizeMB) spikeMeasure(arg, window.__spikeSizeMB);
-            if (PDOS_DEBUG) {
+            if (PDOS_DEBUG || SHOW_FPS) {
+              // True emulator output rate: count frames the engine pushes. onFrame is
+              // additive (onFrameConsumers[] in emulators.js) — js-dos's own renderer
+              // keeps its subscription; ignoring the buffers costs one call per frame.
+              try {
+                arg.events().onFrame(() => {
+                  emuFrames++; emuCum++;
+                  const n = performance.now();
+                  if (n - emuLastT >= 1000) { emuFps = emuFrames; emuFrames = 0; emuLastT = n; }
+                });
+              } catch (e) { console.log("[pdos-fps] onFrame hook unavailable: " + e); }
               setInterval(() => {
-                try { hud.textContent = "FPS " + fps + "  |  " + arg.width() + "x" + arg.height(); }
-                catch (e) { hud.textContent = "FPS " + fps; }
+                try { hud.textContent = "FPS " + fps + " | emu " + emuFps + " | " + arg.width() + "x" + arg.height(); }
+                catch (e) { hud.textContent = "FPS " + fps + " | emu " + emuFps; }
               }, 500);
+              // Hands-free record: 5s-window averages from the cumulative counters
+              // (robust even when the guest pauses frame output on a static screen),
+              // bridged to the native log by the console handler.
+              let lastRafCum = 0, lastEmuCum = 0;
+              setInterval(() => {
+                const raf = (rafCum - lastRafCum) / 5, emu = (emuCum - lastEmuCum) / 5;
+                lastRafCum = rafCum; lastEmuCum = emuCum;
+                let res = ""; try { res = " res=" + arg.width() + "x" + arg.height(); } catch (e) {}
+                console.log("[pdos-fps] raf=" + raf.toFixed(1) + " emu=" + emu.toFixed(1) + res);
+              }, 5000);
             } else {
               hud.style.display = "none";   // hide the debug overlay during play
             }

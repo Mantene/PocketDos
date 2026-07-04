@@ -68,6 +68,13 @@ final class SharedEmulator: ObservableObject {
     private static func startURL(for game: Game) -> URL {
         func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s }
         func abs(_ rel: String) -> String { "\(BundleSchemeHandler.scheme)://\(BundleSchemeHandler.host)/\(rel)" }
+        // DEBUG deploys surface the harness FPS HUD + the 5s [pdos-fps] log cadence
+        // (the Win9x-usability measurement); Release URLs stay clean.
+        #if DEBUG
+        let fpsParam = "&fps=1"
+        #else
+        let fpsParam = ""
+        #endif
         #if DEBUG
         // Sockdrive boot-speed spike: boot Win9x from the chunks bundled at Web/drive/
         // (served at pocketdos://app/drive). index.html's ?sockspike= branch mounts it
@@ -92,7 +99,7 @@ final class SharedEmulator: ObservableObject {
             if let mb = game.memoryMB { s += "&mem=\(mb)" }
             // S2: re-seed a persisted sector-diff into IndexedDB before the drive mounts.
             if let srp = game.sockdriveRestorablePath { s += "&restore=" + enc(abs(srp)) }
-            return URL(string: s) ?? BundleSchemeHandler.startURL
+            return URL(string: s + fpsParam) ?? BundleSchemeHandler.startURL
         }
         guard !game.webRelativeURL.isEmpty else { return BundleSchemeHandler.startURL }
         var q = "?url=" + enc(abs(game.webRelativeURL))
@@ -109,6 +116,6 @@ final class SharedEmulator: ObservableObject {
         }
         if let rp = game.restorablePath, !rp.isEmpty { q += "&restore=" + enc(abs(rp)) }
         if let mt = game.mt32RomsRelativeURL, !mt.isEmpty { q += "&mt32roms=" + enc(abs(mt)) }
-        return URL(string: BundleSchemeHandler.startURL.absoluteString + q) ?? BundleSchemeHandler.startURL
+        return URL(string: BundleSchemeHandler.startURL.absoluteString + q + fpsParam) ?? BundleSchemeHandler.startURL
     }
 }
