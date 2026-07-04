@@ -1,11 +1,17 @@
-# Rebuilding `wdosbox-x.wasm` with General MIDI (FluidSynth)
+# Rebuilding `wdosbox-x.wasm` with General MIDI (FluidSynth) + MT-32 (mt32emu)
 
 `Web/emulators/wdosbox-x.wasm` is a **custom build** of js-dos's DOSBox-X
-emulator with the **FluidSynth** software synthesizer compiled in, so games that
-use General MIDI / MPU-401 (most LucasArts & Sierra adventures, many RPGs) get
-real SoundFont music instead of silence. The stock js-dos `wdosbox-x.wasm` ships
-with the MIDI *dispatcher* but **no synth linked**, so `mididevice=fluidsynth`
-falls back to a null handler and music is silent.
+emulator with **two software synthesizers** compiled in:
+- **FluidSynth** — General MIDI / MPU-401 via a user SoundFont (most LucasArts &
+  Sierra adventures, many RPGs).
+- **mt32emu** (the MUNT library, bundled in DOSBox-X's `src/libs/mt32/`) —
+  authentic Roland MT-32 / CM-32L, the intended sound for many late-80s/early-90s
+  Sierra & LucasArts titles.
+
+The stock js-dos `wdosbox-x.wasm` ships with the MIDI *dispatcher* but **no synth
+linked** (0 `fluid_*` and 0 `mt32emu` symbols), so both fall back to a null
+handler and music is silent. (Quick check on a build: `strings wdosbox-x.wasm |
+grep -ciE 'fluid'` and `... grep -ciE 'mt32emu|munt'` must both be > 0.)
 
 This directory documents how that binary is produced and keeps the source
 modifications (GPL-2 / LGPL-2.1 corresponding source).
@@ -104,6 +110,46 @@ cp build/wasm/wdosbox-x.js.symbols    ../PocketDos/Web/emulators/wdosbox-x.js.sy
 - `native/jsdos/jsdos-emscripten-stubs.c` (new) — stub for
   `pthread_attr_setschedpolicy` (declared but unimplemented in Emscripten's
   single-threaded libc; referenced by FluidSynth's unused thread path).
+
+## MT-32 (mt32emu / MUNT)
+
+MT-32 needed **no DOSBox-X source patch** — DOSBox-X already vendors the full
+mt32emu library under `src/libs/mt32/` and its MIDI handler `src/gui/midi_mt32.h`
+renders into DOSBox's own MIXER channel (the WASM-viable path, like the
+FluidSynth `synth` handler — no standalone OS audio driver). The build just has
+to *compile and link* it. All MT-32 changes live in
+`patches/emulators-jsdos.patch` (`targets/dosbox-x-sdl2.cmake`):
+
+- **`-DC_MT32=1`** on `libdosbox-x-jsdos` (alongside `-DC_FLUIDSYNTH=1`) — enables
+  the `#if C_MT32` MT-32 handler in `src/gui/midi.cpp` / `midi_mt32.h`.
+- **Uncomment the mt32emu sources** in the `libdosbox-x-jsdos` source list
+  (`Synth.cpp`, `Part.cpp`, `Partial.cpp`, `TVA/TVF/TVP`, `LA32*`,
+  `BReverbModel`, `InternalResampler` + `srctools/`, `sha1`, `c_interface`, …).
+- **Leave `srchelper/SoxrAdapter.cpp` and `srchelper/SamplerateAdapter.cpp`
+  commented out** — they `#include <soxr.h>` / `<samplerate.h>` (external libs not
+  built for WASM). mt32emu falls back to its bundled `InternalResampler` when
+  neither `MT32EMU_WITH_LIBSOXR_RESAMPLER` nor `MT32EMU_WITH_LIBSAMPLERATE_RESAMPLER`
+  is defined (our case), so the adapters are never referenced.
+- **Add `${DBX_PATH}/src/libs/mt32` to the include dirs** — `midi_mt32.h` does
+  `#include <mt32emu.h>` (angle brackets), which lives at `src/libs/mt32/mt32emu.h`.
+
+Build/install are identical to the FluidSynth steps above (`ninja -C build/wasm
+wdosbox-x`, then copy the `.js` + `.wasm` + `.js.symbols` trio — they must match).
+
+### ROMs (user-supplied — never bundled)
+
+The Roland MT-32/CM-32L ROMs are proprietary and are **not** shipped (unlike the
+GPL TimGM6mb SoundFont). The app imports the user's ROMs and repackages them into
+`<game>/mt32_roms.zip` with an `MT32_ROMS/` prefix (`GameStore.importMT32ROMs`),
+so they unpack to the **host** path `/home/web_user/MT32_ROMS/` — matching
+`mt32.romdir` (a host Emscripten-MEMFS path, **not** a DOS `C:\` path, same lesson
+as the FluidSynth `.sf2`). `midi_mt32.h` probes for `MT32_CONTROL.ROM` +
+`MT32_PCM.ROM` (or the `CM32L_*` pair). The config editor's "Enable MT-32" button
+appends `[midi] mpu401=intelligent / mididevice=mt32 /
+mt32.romdir=/home/web_user/MT32_ROMS / mt32.thread=false`, and the harness
+(`Web/index.html` `wantsMT32()`) routes such games to the `dosboxX` backend and
+injects the ROM zip — **`.zip` games only** (the `.jsdos` `bundleUpdateConfig`
+path can't add files). In the game's own SETUP, pick Roland MT-32 / MPU-401.
 
 ## SoundFont
 
