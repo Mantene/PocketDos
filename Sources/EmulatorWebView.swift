@@ -1,73 +1,43 @@
 import SwiftUI
 import WebKit
+import UIKit
 
-/// Hosts the js-dos player in a WKWebView whose assets are served from the app
-/// bundle via `BundleSchemeHandler`. Forwards JS `console.*` and uncaught errors
-/// to Xcode's console (prefixed `[web]`) so the spike is debuggable on device.
+/// Thin SwiftUI host for the app's ONE shared WKWebView (owned by `SharedEmulator`). It
+/// re-parents that single WebView into a fresh container per presentation, so the same
+/// WebView — and its single WebContent process — is reused across game launches. (iOS
+/// won't reap a dismissed WebView's process for this app, so a per-game WebView leaked
+/// un-killable ~400 MB processes; see SharedEmulator.) The `Bridge` + console bridge
+/// live here but are instantiated and owned by `SharedEmulator`.
 struct EmulatorWebView: UIViewRepresentable {
+    let shared: SharedEmulator
 
-    /// Same-origin relative path of the game to load (e.g. "lib/<id>/game.jsdos").
-    /// nil → show the bare js-dos loader (used by the spike / fallback).
-    var gameRelativeURL: String? = nil
-    var runCommand: String? = nil
-    var memoryMB: Int? = nil
-    var configOverride: String? = nil
-    var controller: EmulatorController? = nil
-
-    func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
-
-    /// Start URL: the harness, optionally with ?url=<game> (and &run=<cmd> for zips)
-    /// so it autostarts a bundle. The game URL is absolute and same-origin
-    /// (pocketdos://app/lib/...) so js-dos can fetch it without a cross-origin barrier.
-    private var startURL: URL {
-        guard let rel = gameRelativeURL, !rel.isEmpty else { return BundleSchemeHandler.startURL }
-        let absolute = "\(BundleSchemeHandler.scheme)://\(BundleSchemeHandler.host)/\(rel)"
-        var query = "?url=" + (absolute.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? absolute)
-        if let runCommand, !runCommand.isEmpty {
-            query += "&run=" + (runCommand.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? runCommand)
-        }
-        if let memoryMB {
-            query += "&mem=\(memoryMB)"
-        }
-        if let configOverride, !configOverride.isEmpty {
-            query += "&conf=" + (configOverride.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
-        }
-        return URL(string: BundleSchemeHandler.startURL.absoluteString + query)
-            ?? BundleSchemeHandler.startURL
+    func makeUIView(context: Context) -> UIView {
+        let container = UIView()
+        container.backgroundColor = .black
+        attach(shared.webView, to: container)
+        return container
     }
 
-    func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.setURLSchemeHandler(BundleSchemeHandler(), forURLScheme: BundleSchemeHandler.scheme)
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-
-        // Bridge console.log / errors -> native, injected before any page script.
-        let controller = config.userContentController
-        controller.add(context.coordinator, name: "console")
-        controller.addUserScript(WKUserScript(
-            source: Self.consoleBridgeJS,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
-        ))
-
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.isInspectable = true              // enable Safari Web Inspector (iOS 16.4+)
-        webView.scrollView.isScrollEnabled = false
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
-        webView.backgroundColor = .black
-        webView.isOpaque = false
-        webView.navigationDelegate = context.coordinator
-        webView.uiDelegate = context.coordinator   // catch target="_blank" / window.open
-
-        self.controller?.webView = webView
-        webView.load(URLRequest(url: startURL))
-        return webView
+    func updateUIView(_ container: UIView, context: Context) {
+        if shared.webView.superview !== container { attach(shared.webView, to: container) }
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    /// Move the shared WebView into this presentation's container. It survives the old
+    /// container's teardown because `SharedEmulator` holds it strongly; `removeFromSuperview`
+    /// is a no-op when it's unparented.
+    private func attach(_ webView: WKWebView, to container: UIView) {
+        webView.removeFromSuperview()
+        webView.frame = container.bounds
+        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(webView)
+    }
 
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
+    // NOTE: deliberately NOT named `Coordinator`. UIViewRepresentable resolves its
+    // `associatedtype Coordinator` from a nested type of that name; if this were called
+    // `Coordinator`, Swift would demand a `makeCoordinator()` we don't have (SharedEmulator
+    // owns this object's lifecycle, SwiftUI does not). Naming it `Bridge` lets the
+    // associated type default to `Void` and the synthesized `makeCoordinator()` apply.
+    final class Bridge: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
         let emulator: EmulatorController?
 
         init(controller: EmulatorController?) {
@@ -77,9 +47,26 @@ struct EmulatorWebView: UIViewRepresentable {
 
         func userContentController(_ userContentController: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
+            // Hardware-keyboard quick-save (F6) / quick-load (F7). Quick-load is a
+            // reload: the start URL always carries &restore=, so it re-applies the
+            // latest saved session.
+            if message.name == "hotkey", let action = message.body as? String {
+                switch action {
+                case "quicksave": emulator?.persistNow()
+                case "quickload": emulator?.reloadLastSave()
+                default: break
+                }
+                return
+            }
             guard message.name == "console" else { return }
             let text = "\(message.body)"
             print("[web] \(text)")
+
+            // The web layer logs this when it overlays a saved session at launch;
+            // surface it natively so the user gets visible "restored" confirmation.
+            if text.contains("[pdos-restore] restoring") {
+                emulator?.noteRestored()
+            }
 
             // Surface js-dos bundle-load failures as a native alert.
             let lower = text.lowercased()
@@ -94,6 +81,23 @@ struct EmulatorWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
                      withError error: Error) {
             print("[web] navigation failed: \(error.localizedDescription)")
+        }
+
+        // Enforce the app's offline promise: the only top-level navigations allowed
+        // are our own custom scheme (the harness + reloads). The vendored js-dos
+        // runtime carries hardcoded remote endpoints (dos.zone / sockdrive); without
+        // this gate a stray link would let the WebView reach the network. Subresource
+        // fetches (wasm, blob: bundles, audio) are NOT navigations and are unaffected.
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor navigationAction: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            let scheme = navigationAction.request.url?.scheme?.lowercased()
+            if scheme == BundleSchemeHandler.scheme || scheme == "about" {
+                decisionHandler(.allow)
+            } else {
+                print("[web] blocked off-origin navigation: \(navigationAction.request.url?.absoluteString ?? "?")")
+                decisionHandler(.cancel)
+            }
         }
 
         // The WebContent process died (a black screen). For a heavy DOSBox-X /
@@ -115,20 +119,25 @@ struct EmulatorWebView: UIViewRepresentable {
                      windowFeatures: WKWindowFeatures) -> WKWebView? {
             guard let url = navigationAction.request.url else { return nil }
             print("[web] intercepted _blank navigation: \(url.absoluteString)")
-            if url.absoluteString.contains(".jsdos") {
-                let encoded = url.absoluteString
-                    .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-                if let harness = URL(string: BundleSchemeHandler.startURL.absoluteString + "?url=" + encoded) {
-                    webView.load(URLRequest(url: harness))
+            // Only re-route SAME-ORIGIN (pocketdos://) .jsdos links back through the
+            // harness loader. Anything else is off-origin: open it in the system
+            // browser rather than inside our offline WebView (no in-app egress).
+            if url.scheme?.lowercased() == BundleSchemeHandler.scheme {
+                if url.absoluteString.contains(".jsdos") {
+                    let encoded = url.absoluteString
+                        .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                    if let harness = URL(string: BundleSchemeHandler.startURL.absoluteString + "?url=" + encoded) {
+                        webView.load(URLRequest(url: harness))
+                    }
                 }
             } else {
-                webView.load(navigationAction.request)
+                UIApplication.shared.open(url)
             }
             return nil
         }
     }
 
-    private static let consoleBridgeJS = """
+    static let consoleBridgeJS = """
     (function () {
       function post(level, args) {
         try {

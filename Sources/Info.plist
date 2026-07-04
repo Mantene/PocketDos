@@ -20,8 +20,6 @@
     <true/>
     <key>UILaunchScreen</key>
     <dict/>
-    <key>UIRequiresFullScreen</key>
-    <true/>
     <!-- Not-for-profit, no encryption beyond OS-exempt -->
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
@@ -31,12 +29,53 @@
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
-    <!-- Spike allows portrait + landscape; V1 gameplay will be landscape-locked. -->
+    <!-- All orientations declared (Apple is making this mandatory; UIRequiresFullScreen
+         is deprecated and was removed). Gameplay still locks to landscape at RUNTIME via
+         AppDelegate.application(_:supportedInterfaceOrientationsFor:), which is allowed. -->
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <!-- Let games open INTO PocketDOS from Files / share sheets ("Open in PocketDOS").
+         A second import path independent of the in-app picker. Rank "Alternate" so we
+         offer to handle .zip without hijacking it as the system default. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>DOS/Win9x game bundle</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.mantene.jsdos</string>
+                <string>public.zip-archive</string>
+            </array>
+        </dict>
+    </array>
+    <!-- .jsdos is a zip with a .jsdos/ manifest; declare it so the system recognizes the extension. -->
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.mantene.jsdos</string>
+            <key>UTTypeDescription</key>
+            <string>js-dos game bundle</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.zip-archive</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>jsdos</string>
+                </array>
+            </dict>
+        </dict>
     </array>
 </dict>
 </plist>

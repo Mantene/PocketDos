@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PocketDOS</title>
+<!-- Same-origin (pocketdos://app/blank.html) teardown target for leaving a game.
+     Intentionally has NO <script>: it must stay a trivial document so navigating here
+     frees the prior game's ~225 MB MEMFS heap, and a scriptless custom-scheme page also
+     sidesteps the iOS 26 custom-scheme+<script> WebContent crash regression. Why a
+     SAME-ORIGIN blank page and not about:blank: once a real page has committed loads,
+     about:blank's opaque origin makes WebKit treat the round-trip as cross-site and spin
+     a fresh WebContent process per launch (the old one lingers, un-reapable, holding its
+     heap → the "Win98 boots twice then OOMs" pile-up). A same-scheme page hits WebKit's
+     unconditional non-HTTP same-protocol no-swap path → the one shared process is reused. -->
+<style>html,body{margin:0;height:100%;background:#000}</style>
+</head>
+<body></body>
+</html>

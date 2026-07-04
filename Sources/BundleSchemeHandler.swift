@@ -21,6 +21,20 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
     private let rootURL: URL   // bundled Web/ assets
     private let gamesURL: URL  // Documents/Games (imported library)
 
+    #if DEBUG
+    // Sockdrive boot-speed spike instrumentation (DEBUG only). The on-device unknown is
+    // how long a Win9x boot takes when sockdrive fetches its 256 KiB chunks strictly one
+    // at a time (BATCH_SIZE=1, sockdrive.ts) and each fetch hits the SYNCHRONOUS,
+    // main-thread `Data(contentsOf:)` read below. These counters expose the fetch count +
+    // inter-fetch cadence so we can localize the wall. Reset on each `sockdrive.metaj`
+    // open (so relaunches measure fresh); all scheme-task callbacks are main-thread, so
+    // plain statics are safe.
+    private static var sockFetchCount = 0
+    private static var sockFetchBytes = 0
+    private static var sockFirstNs: UInt64 = 0
+    private static var sockLastNs: UInt64 = 0
+    #endif
+
     override init() {
         // `Web` is added to the project as a folder reference, so it lands at
         // <bundle resources>/Web preserving its subdirectory structure.
@@ -39,10 +53,23 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
         if relPath.hasPrefix("lib/") {
             let sub = String(relPath.dropFirst("lib/".count))
             let file = gamesURL.appendingPathComponent(sub).standardizedFileURL
-            return file.path.hasPrefix(gamesURL.standardizedFileURL.path) ? file : nil
+            return Self.contains(gamesURL, file) ? file : nil
         }
         let file = rootURL.appendingPathComponent(relPath).standardizedFileURL
-        return file.path.hasPrefix(rootURL.standardizedFileURL.path) ? file : nil
+        return Self.contains(rootURL, file) ? file : nil
+    }
+
+    /// True iff `file` is `base` itself or lives inside it. Uses a trailing-separator
+    /// boundary so a sibling whose name merely SHARES the prefix (e.g. `…/Games` vs
+    /// `…/GamesEvil`) does not satisfy containment — a plain `hasPrefix` would. This
+    /// is the path-traversal guard for the custom scheme; kept `internal static` so
+    /// it can be unit-tested in isolation.
+    static func contains(_ base: URL, _ file: URL) -> Bool {
+        let basePath = base.standardizedFileURL.path
+        let filePath = file.standardizedFileURL.path
+        if filePath == basePath { return true }
+        let boundary = basePath.hasSuffix("/") ? basePath : basePath + "/"
+        return filePath.hasPrefix(boundary)
     }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
@@ -60,11 +87,38 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
             respondNotFound(url: url, task: task); return
         }
 
+        #if DEBUG
+        // Sockdrive spike: trace chunk GETs served from `drive/` (see static counters).
+        if relPath.hasPrefix("drive/") {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if relPath.hasSuffix("sockdrive.metaj") {
+                Self.sockFirstNs = now; Self.sockLastNs = now
+                Self.sockFetchCount = 0; Self.sockFetchBytes = 0
+                print("[sockspike] ── sockdrive open: \(relPath) (\(data.count) B) ──")
+            } else if relPath.hasSuffix(".raw") {
+                let sinceLastMs = Self.sockLastNs == 0 ? 0 : Double(now - Self.sockLastNs) / 1_000_000
+                let sinceFirstMs = Self.sockFirstNs == 0 ? 0 : Double(now - Self.sockFirstNs) / 1_000_000
+                Self.sockLastNs = now
+                Self.sockFetchCount += 1
+                Self.sockFetchBytes += data.count
+                print(String(format: "[sockspike] chunk #%d %@ (%dB) +%.0fms last, %.0fms total, %.1fMB cum",
+                             Self.sockFetchCount, relPath, data.count, sinceLastMs, sinceFirstMs,
+                             Double(Self.sockFetchBytes) / 1_048_576))
+            }
+        }
+        #endif
+
+        // Bundled assets (engine wasm/js/css) are immutable per app version — let
+        // WebKit cache them so a reload (Restart / quick-load) doesn't re-fetch and
+        // re-compile the multi-MB wasm. Imported games + saves under lib/ are mutable.
+        let cache = relPath.hasPrefix("lib/")
+            ? "no-store"
+            : "public, max-age=31536000, immutable"
         let headers: [String: String] = [
             "Content-Type": Self.mimeType(forPathExtension: fileURL.pathExtension),
             "Content-Length": String(data.count),
             "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-store",
+            "Cache-Control": cache,
         ]
         let response = HTTPURLResponse(url: url, statusCode: 200,
                                        httpVersion: "HTTP/1.1", headerFields: headers)!
@@ -84,6 +138,10 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
         task.didFinish()
     }
 
+    /// Maps a file extension to a Content-Type. The `wasm` case is load-bearing:
+    /// it must stay `application/wasm` so `WebAssembly.instantiateStreaming` works
+    /// and the WebKit WASM JIT engages — reverting it to `octet-stream` silently
+    /// disables the JIT and tanks emulator performance.
     static func mimeType(forPathExtension ext: String) -> String {
         switch ext.lowercased() {
         case "html", "htm": return "text/html; charset=utf-8"

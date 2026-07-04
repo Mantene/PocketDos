@@ -36,9 +36,26 @@ targets:
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: Sources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/PocketDOS.entitlements
-        TARGETED_DEVICE_FAMILY: "1" # iPhone-only for V1
+        TARGETED_DEVICE_FAMILY: "1,2" # iPhone + iPad (native, full-screen via UIRequiresFullScreen)
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
     dependencies:
+      - package: ZIPFoundation
+
+  # Unit tests for the logic layer (GameStore, path-containment, error mapping).
+  PocketDOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mantene.pocketdostests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/PocketDOS.app/PocketDOS
+        BUNDLE_LOADER: $(TEST_HOST)
+    dependencies:
+      - target: PocketDOS
       - package: ZIPFoundation
 
 # A shared scheme so Xcode's Build/Run are available (XcodeGen doesn't create one otherwise).
@@ -47,10 +64,13 @@ schemes:
     build:
       targets:
         PocketDOS: all
+        PocketDOSTests: [test]
     run:
       config: Debug
     test:
       config: Debug
+      targets:
+        - PocketDOSTests
     profile:
       config: Release
     analyze:

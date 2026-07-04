@@ -22,7 +22,7 @@ struct ConfigEditorView: View {
         NavigationStack {
             Form {
                 Section {
-                    Text("These lines are appended to the game's dosbox.conf at launch and override it.\n\nMusic: tap “General MIDI” for rich SoundFont music — best for adventure/RPG games that offer a General MIDI / MPU-401 / Roland option in their setup. Or use AdLib / Sound Blaster for FM music; “Force FM music” hides the MIDI port so auto-detecting games fall back to FM.\n\nIf in-game sound cuts out after a moment, try the other Sound Blaster IRQ.")
+                    Text("These lines are appended to the game's dosbox.conf at launch and override it.\n\nMusic: tap “General MIDI” for rich SoundFont music — best for adventure/RPG games that offer a General MIDI / MPU-401 / Roland option in their setup. “MT-32” gives authentic Roland MT-32 music but needs you to import the copyrighted Roland ROMs first (“Import MT-32 ROMs…” in the game’s menu; .zip games only) and to pick the MT-32 / Roland option in the game’s own setup. Or use AdLib / Sound Blaster for FM music; “Force FM music” hides the MIDI port so auto-detecting games fall back to FM.\n\nIf in-game sound cuts out after a moment, try the other Sound Blaster IRQ.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -48,6 +48,15 @@ struct ConfigEditorView: View {
                         append("[midi]\nmpu401=intelligent\nmididevice=synth\nmidiconfig=/home/web_user/TIMGM6MB.SF2\n")
                     }
                     .buttonStyle(.borderedProminent)
+                    .font(.footnote)
+                    Button("Enable MT-32 (Roland, user ROMs)") {
+                        // mididevice=mt32 renders mt32emu into DOSBox's own mixer
+                        // (WASM-friendly). romdir is a HOST (Emscripten MEMFS) path —
+                        // where the user's injected MT32_ROMS/ zip unpacks — NOT a DOS
+                        // C:\ path. Requires importing copyrighted Roland ROMs first.
+                        append("[midi]\nmpu401=intelligent\nmididevice=mt32\nmt32.romdir=/home/web_user/MT32_ROMS\nmt32.thread=false\n")
+                    }
+                    .buttonStyle(.bordered)
                     .font(.footnote)
                     HStack {
                         Button("Force FM music") { append("[midi]\nmpu401=none\n") }

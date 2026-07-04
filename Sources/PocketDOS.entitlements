@@ -7,5 +7,20 @@
          (separate system process) — included as a low-cost experiment for Win9x. -->
     <key>com.apple.developer.kernel.increased-memory-limit</key>
     <true/>
+    <!-- iCloud Documents sync for per-game save deltas (SPEC H46). The container
+         must be created + the iCloud capability enabled on the signing account;
+         the app gracefully no-ops (local-only) when iCloud is unavailable. -->
+    <key>com.apple.developer.icloud-services</key>
+    <array>
+        <string>CloudDocuments</string>
+    </array>
+    <key>com.apple.developer.icloud-container-identifiers</key>
+    <array>
+        <string>iCloud.com.mantene.PocketDOS</string>
+    </array>
+    <key>com.apple.developer.ubiquity-container-identifiers</key>
+    <array>
+        <string>iCloud.com.mantene.PocketDOS</string>
+    </array>
 </dict>
 </plist>

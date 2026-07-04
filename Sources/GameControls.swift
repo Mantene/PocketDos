@@ -1,11 +1,18 @@
 import SwiftUI
+import UIKit
+
+/// Light haptic tick for virtual-button presses (SPEC F37).
+private let buttonHaptic = UIImpactFeedbackGenerator(style: .light)
 
 /// js-dos key codes (from src/window/dos/controls/keys.ts).
 enum DOSKey {
     static let up = 265, down = 264, left = 263, right = 262
     static let ctrl = 341, alt = 342, shift = 340
-    static let space = 32, esc = 256, enter = 257
+    static let space = 32, esc = 256, enter = 257, tab = 258
     static let n1 = 49, n2 = 50, n3 = 51, n4 = 52, n5 = 53
+    // Alternate movement key-sets (some games use WASD or the numpad, not arrows).
+    static let w = 87, a = 65, s = 83, d = 68               // letters (KBD_w/a/s/d)
+    static let kpUp = 328, kpDown = 322, kpLeft = 324, kpRight = 326   // numpad 8/2/4/6
 }
 
 /// A hold-to-press control: key-down on touch, key-up on release.
@@ -27,7 +34,7 @@ struct HoldKey: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { _ in
-                        if !pressed { pressed = true; controller.keyDown(code) }
+                        if !pressed { pressed = true; buttonHaptic.impactOccurred(); controller.keyDown(code) }
                     }
                     .onEnded { _ in
                         pressed = false; controller.keyUp(code)
@@ -51,6 +58,7 @@ struct TapKey: View {
     let label: String
     var body: some View {
         Button {
+            buttonHaptic.impactOccurred()
             controller.tapKey(code)
         } label: {
             Text(label)
@@ -85,6 +93,7 @@ struct MouseControls: View {
     let controller: EmulatorController
     var body: some View {
         Button {
+            buttonHaptic.impactOccurred()
             controller.rightClick()
         } label: {
             Text("R‑Click")

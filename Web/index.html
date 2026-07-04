@@ -36,8 +36,24 @@
   <script src="js-dos.js"></script>
   <script>
     "use strict";
+    // Flip to true to restore the on-device diagnostics (per-frame audio peak meter,
+    // FPS/resolution HUD, verbose js-dos event logging) used during bring-up. Off for
+    // shipping: those run in the hot audio/render path and cross the native bridge.
+    const PDOS_DEBUG = false;
     const hud = document.getElementById("hud");
     const log = (m) => { console.log(m); hud.textContent = m; };
+
+    // Hardware-keyboard quick-save / quick-load (SPEC H48). F6/F7 are reserved at
+    // the app level: intercepted in the capture phase (before js-dos forwards them
+    // to DOSBox) and bridged to native. No-ops without a hardware keyboard.
+    window.addEventListener("keydown", function (e) {
+      if (e.key !== "F6" && e.key !== "F7") return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      try {
+        window.webkit.messageHandlers.hotkey.postMessage(e.key === "F6" ? "quicksave" : "quickload");
+      } catch (err) { /* not running under the native host */ }
+    }, true);
 
     // Point the emulators runtime at our bundled, same-origin assets.
     if (typeof emulators !== "undefined") {
@@ -123,9 +139,10 @@
       window.addEventListener("focus", () => { assertPlaybackSession(); contexts.forEach(recover); }, true);
 
       // Instrument the ScriptProcessor js-dos uses, to confirm frames are produced
-      // and whether they carry actual (non-zero) audio.
+      // and whether they carry actual (non-zero) audio. DEBUG-only: this scans every
+      // audio buffer in the realtime callback, so it must not ship enabled.
       const proto = Orig.prototype;
-      if (proto && proto.createScriptProcessor) {
+      if (PDOS_DEBUG && proto && proto.createScriptProcessor) {
         const origCSP = proto.createScriptProcessor;
         proto.createScriptProcessor = function (...a) {
           const node = origCSP.apply(this, a);
@@ -171,7 +188,18 @@
       return conf + "\n[dosbox]\nmemsize=" + mb + "\n";
     }
 
-    async function resolveBundleUrl(url, runCmd, memMb, confOverride) {
+    // Set key=value in a dosbox.conf SECTION: replace the key in place if present, else inject
+    // it under the section header, else append the whole section. (Generalizes setMemsize.)
+    function setConf(conf, key, value, section) {
+      const line = key + "=" + value;
+      const keyRe = new RegExp("^[ \\t]*" + key + "[ \\t]*=.*$", "mi");
+      if (keyRe.test(conf)) return conf.replace(keyRe, line);
+      const secRe = new RegExp("\\[" + section + "\\]", "i");
+      if (secRe.test(conf)) return conf.replace(secRe, "[" + section + "]\n" + line);
+      return conf + "\n[" + section + "]\n" + line + "\n";
+    }
+
+    async function resolveBundleUrl(url, runCmd, memMb, confOverride, mt32RomsUrl) {
       if (!url) return url;
       const isZip = /\.zip(\?|#|$)/i.test(url);
       // Plain .jsdos with no overrides → load directly.
@@ -189,6 +217,14 @@
         if (wantsGeneralMidi(confOverride)) {
           log("adding General MIDI soundfont…");
           bundle.extract(new URL("soundfont.zip", location.href).href);
+        }
+        // MT-32: inject the user's repackaged ROM zip (MT32_ROMS/ prefix →
+        // /home/web_user/MT32_ROMS/, matching mt32.romdir). ROMs are copyrighted,
+        // so they're user-supplied, never bundled.
+        if (wantsMT32(confOverride) && mt32RomsUrl) {
+          log("adding MT-32 ROMs…");
+          try { bundle.extract(mt32RomsUrl); }
+          catch (e) { log("MT-32 ROMs missing — import them from the game's DOS config menu."); }
         }
         // Auto-run a chosen executable: append to [autoexec] (which already does
         // `mount c .` + `c:`) so it runs after the drive is mounted.
@@ -235,18 +271,23 @@
     const _confParam = new URLSearchParams(location.search).get("conf") || "";
     const wantsGeneralMidi = (conf) =>
       /mididevice\s*=\s*\w*synth/i.test(conf || "") || /\.sf2\b/i.test(conf || "");
-    const BACKEND = wantsGeneralMidi(_confParam) ? "dosboxX" : "dosbox";
+    // MT-32 (Roland) via mt32emu, compiled into the same rebuilt dosbox-x wasm.
+    const wantsMT32 = (conf) =>
+      /mididevice\s*=\s*mt32/i.test(conf || "") || /mt32\.romdir/i.test(conf || "");
+    const BACKEND = (wantsGeneralMidi(_confParam) || wantsMT32(_confParam)) ? "dosboxX" : "dosbox";
     const GAME_URL = "games/game.jsdos"; // drop a .jsdos here to autostart
     // -----------------------------------------------------------------------
 
-    // Lightweight on-screen FPS meter (rAF cadence ~ render rate).
+    // Lightweight on-screen FPS meter (rAF cadence ~ render rate). DEBUG-only.
     let frames = 0, lastT = performance.now(), fps = 0;
-    (function tick() {
-      frames++;
-      const now = performance.now();
-      if (now - lastT >= 1000) { fps = frames; frames = 0; lastT = now; }
-      requestAnimationFrame(tick);
-    })();
+    if (PDOS_DEBUG) {
+      (function tick() {
+        frames++;
+        const now = performance.now();
+        if (now - lastT >= 1000) { fps = frames; frames = 0; lastT = now; }
+        requestAnimationFrame(tick);
+      })();
+    }
 
     // Lockdown Mode disables WebAssembly entirely (decided behavior: warn).
     if (typeof WebAssembly === "undefined") {
@@ -254,10 +295,306 @@
       throw new Error("WASM unavailable");
     }
 
-    function startDos(url) {
+    // ---- Session persistence -----------------------------------------------
+    // js-dos has no CPU/RAM save-state; it persists the FILESYSTEM delta (files
+    // changed since boot). The native layer pulls this delta out (base64) on
+    // background/quit and stores it per-game; on relaunch it's fed back as a
+    // second init bundle (options.initFs), so saved games + an installed Win9x
+    // (its changed HDD image is just a changed file) survive across sessions.
+    function u8ToBase64(u8) {
+      let s = "";
+      const CHUNK = 0x8000;            // chunk so .apply() doesn't blow the stack
+      for (let i = 0; i < u8.length; i += CHUNK) {
+        s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+      }
+      return btoa(s);
+    }
+
+    // Chunked persist transport. ci.persist(true) builds the filesystem-delta ZIP in
+    // the page; native pulls it out in base64 CHUNKS rather than one string — a single
+    // base64 string of a large (Win9x) delta hits a ~512MB JS-engine string-length
+    // limit (RAM-independent), so it can't be marshalled whole. Native streams the
+    // chunks straight to disk (begin → repeated chunk → end).
+    let __pdosDelta = null;
+
+    // Cheap non-crypto fingerprint (FNV-1a over 32-bit words + byte length) so an
+    // UNCHANGED autosave can skip the (multi-MB, flash-wearing) disk rewrite. We avoid
+    // crypto.subtle: it isn't guaranteed in a custom-scheme (non-secure) context, and
+    // change-detection doesn't need cryptographic strength.
+    function pdosFingerprint(u8) {
+      // Cheap non-crypto FNV-1a (byte length + content) for change-detection. Read bytes
+      // DIRECTLY (assemble 32-bit words by hand) rather than via a Uint32Array view:
+      // ci.persist's returned buffer is NOT guaranteed 4-aligned, and an unaligned
+      // `new Uint32Array(buf, byteOffset, …)` THROWS — which would be caught and turn
+      // every save into a silent no-op (data loss). Word-at-a-time stays ~4× faster than per-byte.
+      const n = u8.byteLength;
+      let h = 0x811c9dc5 >>> 0, i = 0;
+      for (; i + 4 <= n; i += 4) {
+        const word = (u8[i] | (u8[i + 1] << 8) | (u8[i + 2] << 16) | (u8[i + 3] << 24)) >>> 0;
+        h = (h ^ word) >>> 0; h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      for (; i < n; i++) { h = (h ^ u8[i]) >>> 0; h = Math.imul(h, 0x01000193) >>> 0; }
+      return n.toString(16) + "-" + (h >>> 0).toString(16);
+    }
+
+    // Begin a persist: capture the delta, return its byte length + fingerprint (length
+    // 0 when nothing changed yet / engine not running → native keeps the prior save).
+    window.pdosPersistBegin = async function () {
+      try {
+        __pdosDelta = null;
+        if (!window.ci || typeof window.ci.persist !== "function") {
+          console.log("[pdos-persist] engine not ready — nothing to save");
+          return { length: 0 };
+        }
+        console.log("[pdos-persist] capturing filesystem changes…");
+        const out = await window.ci.persist(true);   // Uint8Array (normal) | {drives:[{url,persist}]} (sockdrive) | null
+        // A sockdrive game's disk lives in IndexedDB, not MEMFS, so persist() returns the
+        // sockdrives object (see emulators src/protocol/protocol.ts persist()). Pull the
+        // mounted drive's serialized sector-diff (a Uint8Array), matched by the mounted base
+        // with a fallback to the sole drive. A plain Uint8Array here is the (irrelevant)
+        // MEMFS conf delta of a sockdrive boot → treat as nothing to save.
+        let bytes = out;
+        if (out && out.drives) {
+          const drive = out.drives.find((d) => d.url === window.__pdosSockBase) || out.drives[0];
+          bytes = drive ? drive.persist : null;
+        }
+        if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
+          console.log("[pdos-persist] no changes to save");
+          return { length: 0 };
+        }
+        __pdosDelta = bytes;
+        const fp = pdosFingerprint(bytes);
+        console.log("[pdos-persist] captured " + bytes.length + " bytes (fp " + fp + ")");
+        return { length: bytes.length, fp: fp };
+      } catch (e) {
+        console.error("[pdos-persist] begin failed: " + (e && e.message ? e.message : e));
+        __pdosDelta = null;
+        return { length: 0 };
+      }
+    };
+
+    // Return one base64 chunk [off, off+len) of the captured delta ("" past the end).
+    window.pdosPersistChunk = function (off, len) {
+      if (!__pdosDelta) return "";
+      const end = Math.min(off + len, __pdosDelta.length);
+      if (off >= end) return "";
+      return u8ToBase64(__pdosDelta.subarray(off, end));
+    };
+
+    // Release the captured delta after streaming (or on abort).
+    window.pdosPersistEnd = function () { __pdosDelta = null; return true; };
+
+    // Fetch a previously-saved changes bundle (same-origin via BundleSchemeHandler).
+    // Returns Uint8Array or null. Becomes the second init bundle on restore.
+    async function loadRestoreInitFs(restoreUrl) {
+      if (!restoreUrl) return null;
+      try {
+        const resp = await fetch(restoreUrl);
+        if (!resp.ok) { console.log("[pdos-restore] no saved session (HTTP " + resp.status + ")"); return null; }
+        const bytes = new Uint8Array(await resp.arrayBuffer());
+        if (!bytes.length) { console.log("[pdos-restore] saved session empty"); return null; }
+        console.log("[pdos-restore] restoring " + bytes.length + " bytes of saved changes");
+        return bytes;
+      } catch (e) {
+        console.warn("[pdos-restore] fetch failed: " + (e && e.message ? e.message : e));
+        return null;
+      }
+    }
+
+    // Re-seed a persisted sockdrive sector-diff into IndexedDB BEFORE the drive mounts, so
+    // the sockdrive client reads it at init (it reads key 0 of the "write" store on mount —
+    // emulators src/protocol/sockdrive.ts). The DB schema MUST match the client exactly
+    // (db name "sockdrive (<base>)" v1, stores "raw"+"write"; see sockdrive-store.ts): if we
+    // created only "write", the client opening the existing v1 DB skips onupgradeneeded and
+    // its read-cache transactions on "raw" would throw. Value format mirrors the client's
+    // put(): new Blob([bytes.buffer]) at key 0 (its get() reads the Blob back as a Uint8Array).
+    function reseedSockdriveWrites(base, bytes) {
+      return new Promise((resolve) => {
+        let req;
+        try { req = indexedDB.open("sockdrive (" + base + ")", 1); }
+        catch (e) { console.warn("[pdos-sock] reseed open threw: " + (e && e.message ? e.message : e)); resolve(false); return; }
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains("raw")) {
+            db.createObjectStore("raw").createIndex("range", "", { multiEntry: false });
+          }
+          if (!db.objectStoreNames.contains("write")) {
+            db.createObjectStore("write").createIndex("sector", "", { multiEntry: false });
+          }
+        };
+        req.onerror = () => { console.warn("[pdos-sock] reseed open failed"); resolve(false); };
+        req.onsuccess = () => {
+          const db = req.result;
+          try {
+            const tx = db.transaction("write", "readwrite");
+            tx.objectStore("write").put(new Blob([bytes.buffer]), 0);
+            tx.oncomplete = () => { console.log("[pdos-sock] re-seeded " + bytes.length + " bytes of writes"); db.close(); resolve(true); };
+            tx.onerror = () => { console.warn("[pdos-sock] reseed put failed"); db.close(); resolve(false); };
+          } catch (e) { console.warn("[pdos-sock] reseed txn threw: " + (e && e.message ? e.message : e)); db.close(); resolve(false); }
+        };
+      });
+    }
+    // -----------------------------------------------------------------------
+
+    // ---- Tier-0 disk-image feasibility spike (DEBUG, gated on ?imgtest=<MB>) --
+    // Measures the MEMORY wall for on-device Win9x images. Synthesizes an
+    // INCOMPRESSIBLE N-MB image (a zeroed buffer would deflate to ~nothing and
+    // falsely pass), writes it into MEMFS via the documented ci.fsWriteFile (the
+    // same API a future chunked save transport would use), then runs the real
+    // persist(true) + base64 round-trip — the dominant heap cost that OOM-kills
+    // the WebContent process. Staged logging localizes WHERE it dies (alloc vs
+    // MEMFS write vs persist), giving both the load and persist ceilings from one
+    // run. On iOS the only heap signal is survival (a crash = Jetsam OOM, surfaced
+    // natively as __CRASH__); performance.memory is logged when present (Chrome).
+    // The image need not be valid FAT — mount validity is a Tier-1 concern. The
+    // incompressible fill makes this a conservative worst case vs a real
+    // (compressible, partly-sparse) Win9x image. NOT a production code path.
+    function spikeHeapMB() {
+      try { if (performance && performance.memory) return Math.round(performance.memory.usedJSHeapSize / 1048576); }
+      catch (e) {}
+      return -1;   // unavailable on iOS WebKit — rely on process survival instead
+    }
+
+    async function runDiskSpike(sizeMB, memMb) {
+      log("[spike] disk-image feasibility: " + sizeMB + " MB image @ memsize=" + memMb);
+      // A minimal default bundle boots a DOS machine with a persistable C:.
+      const bundle = await emulators.bundle();
+      bundle.dosboxConf = setMemsize(bundle.dosboxConf, memMb);
+      const u8 = await bundle.toUint8Array();
+      window.__spikeSizeMB = sizeMB;     // picked up in onEvent ci-ready → spikeMeasure
+      startDos(URL.createObjectURL(new Blob([u8])), null);
+    }
+
+    // ---- Tier-1 sockdrive BOOT-SPEED spike (DEBUG, gated on ?sockspike=<base>) ----
+    // Boots Win9x from a sockdrive whose 256 KiB chunks are served from <base> (e.g.
+    // pocketdos://app/drive) by the native scheme handler. Measures the ONE unknown the
+    // Chrome/Mac spike couldn't: wall-clock boot time on a real iPhone, where sockdrive's
+    // sequential one-file-per-chunk fetches (BATCH_SIZE=1) cross WebKit's IPC + a
+    // main-thread file read per chunk. No disk is bundled — the conf-only bundle just
+    // mounts the sockdrive and boots it. sockdrive forces dosboxX (plain dosbox lacks it).
+    // NOT a production code path.
+    async function runSockSpike(base, memMb) {
+      log("[sockspike] booting Win9x from sockdrive: " + base + " @ memsize=" + memMb);
+      window.__sockStart = performance.now();
+      const bundle = await emulators.bundle();
+      // Replace the [autoexec] section (always the last section in dosbox.conf) with the
+      // exact block proven in the Chrome spike — `mount c .`/`c:` from the default bundle
+      // are irrelevant once `boot` hands off, but replacing avoids any ambiguity.
+      // `imgmount n sockdrive <url>` is the single-URL HTTP form (dos_programs.cpp) → the
+      // client fetches <url>/sockdrive.metaj and <url>/<N>.raw; `boot c:` boots the image.
+      let conf = setMemsize(bundle.dosboxConf, memMb);
+      const cut = conf.search(/^\[autoexec\]/im);
+      if (cut >= 0) conf = conf.slice(0, cut);
+      conf += "[autoexec]\necho off\nimgmount 2 sockdrive " + base + "\nboot c:\n";
+      bundle.dosboxConf = conf;
+      const u8 = await bundle.toUint8Array();
+      startDos(URL.createObjectURL(new Blob([u8])), null, "dosboxX");
+    }
+
+    // ---- sockdrive WRITE-LOAD spike (DEBUG, gated on ?writespike=<base>) ----
+    // Measures the make-or-break unknown for an on-device install wizard: how many MB of
+    // WRITES to a sockdrive the WebContent process survives before OOM. sockdrive holds
+    // every written sector in an in-page Map (storedSectors) with no flush, plus a C++
+    // copy — a full Win98 install (~200MB) is predicted to OOM mid-install. This boots the
+    // bundled MS-DOS 7.1 floppy (writespike.img, injected into MEMFS) onto the existing
+    // win98 sockdrive as C:, and its AUTOEXEC.BAT copies ~272KB to C: ~1500 times (~398MB),
+    // printing "WRITTEN ~N MB" markers. Writes are sector-diffs (in-heap), never persisted,
+    // so the base .raw chunks are untouched — non-destructive. Watch for the crash; the
+    // last marker shown is the OOM ceiling. NOT a production code path.
+    async function runWriteSpike(base) {
+      log("[writespike] sockdrive write-load test on " + base + " (boots DOS floppy, writes to C:)");
+      const bundle = await emulators.bundle();
+      // Put the floppy into the bundle's C: via the SAME zip-extract mechanism game zips
+      // and the soundfont use (line ~208) → lands at C:\writespike.img. (initFs file-entry
+      // injection didn't land it where `mount c .` maps C:, so use the proven path.)
+      bundle.extract(new URL("writespike.zip", location.href).href);
+      // mount c . + c: so the extracted floppy is reachable, imgmount it as A:, mount the
+      // sockdrive at HDD slot 2 (= C: after boot), then boot the floppy whose AUTOEXEC.BAT
+      // runs the write loop.
+      let conf = bundle.dosboxConf;
+      const cut = conf.search(/^\[autoexec\]/im);
+      if (cut >= 0) conf = conf.slice(0, cut);
+      conf += "[autoexec]\necho off\nmount c .\nc:\nimgmount a: writespike.img -U\nimgmount 2 sockdrive " + base + "\nboot a:\n";
+      bundle.dosboxConf = conf;
+      const u8 = await bundle.toUint8Array();
+      startDos(URL.createObjectURL(new Blob([u8])), null, "dosboxX");
+    }
+
+    // ---- PRODUCTION sockdrive boot (gated on ?drive=<base>) ----
+    // The shipping path for a sockdrive game: <base> is pocketdos://app/lib/<id>/drive,
+    // whose 256 KiB chunks the native scheme handler serves from Documents/Games/<id>/drive.
+    // Same mount as the boot-speed spike — a conf-only bundle whose [autoexec] mounts the
+    // sockdrive at HDD slot 2 and boots it — but with no spike instrumentation. sockdrive
+    // REQUIRES dosbox-x (plain dosbox lacks the client), so the backend is forced here.
+    async function bootFromSockdrive(base, memMb, restoreUrl) {
+      log("booting from sockdrive: " + base);
+      // Remembered so pdosPersistBegin can pick THIS drive's sector-diff out of persist().
+      window.__pdosSockBase = base;
+      // S2: re-seed a previously-saved sector-diff into IndexedDB before the drive mounts
+      // (so the client restores prior writes). Uses the same same-origin fetch as a normal
+      // restore (its "[pdos-restore] restoring" log drives the "Session restored" toast).
+      const writes = await loadRestoreInitFs(restoreUrl);   // Uint8Array sector-diff, or null
+      if (writes) await reseedSockdriveWrites(base, writes);
+      const bundle = await emulators.bundle();
+      let conf = setMemsize(bundle.dosboxConf, memMb);
+      // Win9x guest mouse: MATCH the known-good reference conf from the original bundle-loaded
+      // Win98 where the mouse works — `testdata/system-win98-v1.jsdos` ships [sdl] autolock=false +
+      // mouse_emulation=integration. Integration drives an ABSOLUTE cursor (user_cursor_x/y in
+      // jsdos-x-main.cpp `server_mouse_moved`) that THIS image follows: js-dos sends absolute touch
+      // (autolock=false → mouseNotLocked → sendMouseMotion) and integration applies it. (An earlier
+      // theory used autolock=true + mouse_emulation=locked to send RELATIVE motion — but integration
+      // discards relative, and locked drops absolute, so the cursor stayed dead. The working conf wins.)
+      conf = setConf(conf, "autolock", "false", "sdl");
+      conf = setConf(conf, "mouse_emulation", "integration", "sdl");
+      log("[pdos-mouse] Win9x guest: autolock=false + mouse_emulation=integration (absolute mouse, matches system-win98 bundle)");
+      const cut = conf.search(/^\[autoexec\]/im);
+      if (cut >= 0) conf = conf.slice(0, cut);
+      conf += "[autoexec]\necho off\nimgmount 2 sockdrive " + base + "\nboot c:\n";
+      bundle.dosboxConf = conf;
+      // Conclusive readback: prove WHAT actually reached DOSBox (the [sdl] block + backend),
+      // so the next device boot diagnoses instead of theorizing. setConf replaces a key in place
+      // if present, else injects/appends a [sdl] block — this shows which happened.
+      const sdl = (conf.match(/\[sdl\][\s\S]*?(?=\n\[|$)/i) || ["<no [sdl] section>"])[0];
+      log("[pdos-mouse] applied [sdl]:\n" + sdl);
+      log("[pdos-mouse] backend=dosboxX  base=" + base);
+      const u8 = await bundle.toUint8Array();
+      // initFs stays null: a sockdrive's writes restore via IndexedDB (above), NOT a MEMFS overlay.
+      startDos(URL.createObjectURL(new Blob([u8])), null, "dosboxX");
+    }
+
+    async function spikeMeasure(ci, sizeMB) {
+      const MB = 1048576;
+      try {
+        log("[spike] heap before alloc: " + spikeHeapMB() + " MB");
+        let img = new Uint8Array(sizeMB * MB);
+        // Fill with a fast xorshift PRNG (32-bit words) so the data is
+        // incompressible → the persist delta ≈ the image size (worst case).
+        const words = new Uint32Array(img.buffer);
+        let x = 0x9e3779b9 >>> 0;
+        for (let i = 0; i < words.length; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; x >>>= 0; words[i] = x; }
+        log("[spike] allocated + filled " + sizeMB + " MB; heap=" + spikeHeapMB() + " MB");
+        await ci.fsWriteFile("imgtest.img", img);   // → MEMFS (the Tier-1/3 load path)
+        img = null;                                  // release the JS copy before persist
+        log("[spike] wrote image to MEMFS; heap=" + spikeHeapMB() + " MB");
+        const delta = await ci.persist(true);        // changes ZIP, including our file
+        const dMB = Math.round(((delta && delta.length) || 0) / MB);
+        log("[spike] persist delta=" + dMB + " MB; heap=" + spikeHeapMB() + " MB");
+        const b64 = u8ToBase64(delta);               // the real native-transport cost
+        const bMB = Math.round(b64.length / MB);
+        log("[spike] ✅ SURVIVED " + sizeMB + " MB  (delta " + dMB + " MB, base64 " + bMB + " MB, heap " + spikeHeapMB() + " MB)");
+      } catch (e) {
+        log("[spike] ❌ FAILED at " + sizeMB + " MB: " + (e && e.message ? e.message : e));
+      }
+    }
+    // -----------------------------------------------------------------------
+
+    function startDos(url, initFs, backendOverride) {
       const options = {
         pathPrefix: "emulators/",   // resolves to pocketdos://app/emulators/
-        backend: BACKEND,
+        // sockdrive REQUIRES the dosbox-x backend (the plain dosbox wasm lacks it),
+        // so the sockdrive spike forces it via backendOverride; everything else keeps
+        // the MIDI/MT32-driven BACKEND choice.
+        backend: backendOverride || BACKEND,
         workerThread: USE_WORKER,
         offscreenCanvas: USE_OFFSCREEN,
         autoStart: true,
@@ -274,21 +611,46 @@
           "{ctrl} {alt} : {space} {up} {down} {left} {right}",
         ],
         onEvent: (event, arg) => {
-          console.log("js-dos event:", event);
-          if (event === "emu-ready") log("emulator ready…");
+          if (PDOS_DEBUG) console.log("js-dos event:", event);
+          // Sockdrive boot-speed spike: log wall-clock from launch to each milestone.
+          // (ci-ready ≠ Win98 desktop; the desktop is observed by stopwatch on device.)
+          const sockMs = () => window.__sockStart ? Math.round(performance.now() - window.__sockStart) : null;
+          if (event === "emu-ready") {
+            const t = sockMs();
+            log("emulator ready…" + (t !== null ? " [sockspike +" + t + "ms]" : ""));
+          }
           if (event === "ci-ready") {
             window.ci = arg;
-            log("running — ci-ready");
-            setInterval(() => {
-              try { hud.textContent = "FPS " + fps + "  |  " + arg.width() + "x" + arg.height(); }
-              catch (e) { hud.textContent = "FPS " + fps; }
-            }, 500);
+            const t = sockMs();
+            log("running — ci-ready" + (t !== null ? " [sockspike +" + t + "ms to ci-ready]" : ""));
+            if (window.__spikeSizeMB) spikeMeasure(arg, window.__spikeSizeMB);
+            if (PDOS_DEBUG) {
+              setInterval(() => {
+                try { hud.textContent = "FPS " + fps + "  |  " + arg.width() + "x" + arg.height(); }
+                catch (e) { hud.textContent = "FPS " + fps; }
+              }, 500);
+            } else {
+              hud.style.display = "none";   // hide the debug overlay during play
+            }
           }
         },
       };
       if (url) options.url = url;
+      // Saved filesystem changes load as a second bundle, overlaying the base
+      // (extracted after fsCreatedAt → they win AND re-export on the next save).
+      if (initFs) options.initFs = initFs;
       window.props = Dos(document.getElementById("app"), options);
     }
+
+    // Native teardown hook: EmulatorController.teardown() calls this before navigating
+    // to the same-origin blank page when leaving a game. Stop the DOSBox worker so its
+    // ~225 MB MEMFS heap (the mounted Win9x disk image) is released promptly; the
+    // subsequent navigation is the hard guarantee (it tears down this document + worker).
+    window.pdosTeardown = function () {
+      try { if (window.props && typeof window.props.stop === "function") window.props.stop(); } catch (e) {}
+      window.ci = null;
+      window.props = null;
+    };
 
     // A ?url= param (set by the native WKUIDelegate when a sockdrive/_blank
     // quick-link is tapped, or for "load by url") takes priority.
@@ -296,11 +658,35 @@
     const PARAM_RUN = new URLSearchParams(location.search).get("run");
     const PARAM_MEM = new URLSearchParams(location.search).get("mem");
     const PARAM_CONF = new URLSearchParams(location.search).get("conf");
+    const PARAM_RESTORE = new URLSearchParams(location.search).get("restore");
+    const PARAM_MT32ROMS = new URLSearchParams(location.search).get("mt32roms");
+    const PARAM_DRIVE = new URLSearchParams(location.search).get("drive");  // production sockdrive game (<base>)
+    const PARAM_IMGTEST = new URLSearchParams(location.search).get("imgtest");  // DEBUG: disk-image feasibility spike
+    const PARAM_SOCKSPIKE = new URLSearchParams(location.search).get("sockspike");  // DEBUG: sockdrive boot-speed spike (<base>)
+    const PARAM_WRITESPIKE = new URLSearchParams(location.search).get("writespike");  // DEBUG: sockdrive write-load OOM spike (<base>)
 
-    if (PARAM_URL) {
+    if (PARAM_DRIVE) {
+      // Production sockdrive game (see bootFromSockdrive); bypasses the zip-bundle load.
+      bootFromSockdrive(PARAM_DRIVE, PARAM_MEM ? parseInt(PARAM_MEM, 10) : 64, PARAM_RESTORE);
+    } else if (PARAM_IMGTEST) {
+      // DEBUG disk-image feasibility spike (see runDiskSpike); bypasses normal load.
+      runDiskSpike(parseInt(PARAM_IMGTEST, 10) || 0, PARAM_MEM ? parseInt(PARAM_MEM, 10) : 64);
+    } else if (PARAM_SOCKSPIKE) {
+      // DEBUG sockdrive boot-speed spike (see runSockSpike); bypasses normal load.
+      runSockSpike(PARAM_SOCKSPIKE, PARAM_MEM ? parseInt(PARAM_MEM, 10) : 64);
+    } else if (PARAM_WRITESPIKE) {
+      // DEBUG sockdrive write-load OOM spike (see runWriteSpike); bypasses normal load.
+      runWriteSpike(PARAM_WRITESPIKE);
+    } else if (PARAM_URL) {
       log("loading " + PARAM_URL + " …");
-      resolveBundleUrl(PARAM_URL, PARAM_RUN, PARAM_MEM ? parseInt(PARAM_MEM, 10) : null, PARAM_CONF)
-        .then((resolved) => startDos(resolved))
+      Promise.all([
+        resolveBundleUrl(PARAM_URL, PARAM_RUN, PARAM_MEM ? parseInt(PARAM_MEM, 10) : null, PARAM_CONF, PARAM_MT32ROMS),
+        loadRestoreInitFs(PARAM_RESTORE),
+      ])
+        .then(([resolved, initFs]) => {
+          if (initFs) log("restoring saved session…");
+          startDos(resolved, initFs);
+        })
         .catch((e) => {
           console.error("[panic] zip conversion failed: " + (e && e.message ? e.message : e));
           log("Couldn't convert this zip into a game:\n" + (e && e.message ? e.message : e));
