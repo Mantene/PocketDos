@@ -1,0 +1,3 @@
+# DOS-consumed install assets: bytes are load-bearing (INF needs CRLF; drv/zip binary).
+# Never let git normalize line endings on these.
+Web/install/** -text
