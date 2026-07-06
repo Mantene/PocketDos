@@ -8,11 +8,13 @@ enum LibrarySheet: Identifiable {
     case launchPicker(Game)
     case config(Game)
     case about
+    case installWizard
     var id: String {
         switch self {
         case .launchPicker(let g): return "p" + g.id
         case .config(let g): return "c" + g.id
         case .about: return "about"
+        case .installWizard: return "wizard"
         }
     }
 }
@@ -105,10 +107,21 @@ struct LibraryView: View {
             .navigationTitle("PocketDOS")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        importing = true
+                    // One "+" menu: import a ready-made game, or build a Windows 98
+                    // machine from the user's own CD image (the install wizard).
+                    Menu {
+                        Button {
+                            importing = true
+                        } label: {
+                            Label("Import game…", systemImage: "square.and.arrow.down")
+                        }
+                        Button {
+                            sheet = .installWizard
+                        } label: {
+                            Label("New Windows 98 machine…", systemImage: "opticaldisc")
+                        }
                     } label: {
-                        Label("Import", systemImage: "plus")
+                        Label("Add", systemImage: "plus")
                     }
                 }
                 ToolbarItem(placement: .topBarLeading) {
@@ -152,6 +165,8 @@ struct LibraryView: View {
                     }
                 case .about:
                     AboutView()
+                case .installWizard:
+                    InstallWizardView { sheet = nil }
                 }
             }
             .fileImporter(isPresented: $importing,
