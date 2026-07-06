@@ -164,6 +164,28 @@ struct ISO9660Image {
         return try read(at: record.dataOffset, count: size, what: path)
     }
 
+    /// Reads `count` bytes of a file starting at byte `offset` — the streaming
+    /// counterpart of `readFile(atPath:maxBytes:)` for callers that copy
+    /// CAB-sized files in bounded chunks (the FAT16 install-source builder)
+    /// instead of materializing them. Ranges must lie inside the file: a
+    /// partial answer would silently truncate whatever is being copied.
+    ///
+    /// Each call re-walks `path` (a few 2 KB directory-sector reads); at the
+    /// builder's 4 MiB chunk size that overhead is noise, and it keeps this
+    /// method stateless like the rest of the API.
+    func readFile(atPath path: String, offset: Int, count: Int) throws -> Data {
+        guard offset >= 0, count >= 0 else {
+            throw ISOError.invalidArgument("offset and count must be non-negative")
+        }
+        let record = try record(atPath: path)
+        guard !record.isDirectory else { throw ISOError.notAFile(path) }
+        guard offset + count <= Int(record.dataLength) else {
+            throw ISOError.invalidArgument(
+                "range \(offset)..<\(offset + count) is outside \(path) (\(record.dataLength) bytes)")
+        }
+        return try read(at: record.dataOffset + UInt64(offset), count: count, what: path)
+    }
+
     /// Cheap authenticity probe for the wizard's ISO picker: a Win98 SE CD has a
     /// \WIN98 directory holding SETUP.EXE plus dozens of *.CAB archives. Requiring
     /// ≥ 10 CABs rejects random ISOs and boot-floppy-only images without
