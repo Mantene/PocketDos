@@ -577,18 +577,44 @@ extension FAT16ImageBuilder {
     /// `productKey` is the user's own credential. It is burned into
     /// MSBATCH.INF inside the image and goes NOWHERE else — never logged,
     /// never interpolated into an error message.
+    ///
+    /// `progress`, when given, is called after each copied file with
+    /// (copiedBytes, totalBytes) so the wizard can show a percentage; the
+    /// denominator is pre-computed by walking the \WIN98 tree (a few dozen
+    /// 2 KB directory reads — noise next to the ~170 MB copy itself).
     static func buildInstallSource(from iso: ISO9660Image, productKey: String,
-                                   at url: URL) throws {
+                                   at url: URL,
+                                   progress: (_ copiedBytes: Int, _ totalBytes: Int) -> Void = { _, _ in }) throws {
         let builder = try FAT16ImageBuilder(creatingImageAt: url)
-        try builder.copyTree(from: iso, isoPath: "WIN98", imagePath: "WIN98")
+        let total = try treeBytes(of: iso, at: "WIN98")
+        var copied = 0
+        try builder.copyTree(from: iso, isoPath: "WIN98", imagePath: "WIN98") { fileBytes in
+            copied += fileBytes
+            progress(copied, total)
+        }
         try builder.addFile(path: "MSBATCH.INF", data: msbatchINF(productKey: productKey))
         try builder.close()
     }
 
+    /// Total file bytes under an ISO directory — the progress denominator.
+    private static func treeBytes(of iso: ISO9660Image, at path: String) throws -> Int {
+        var total = 0
+        for entry in try iso.list(directory: path) {
+            if entry.isDirectory {
+                total += try treeBytes(of: iso, at: path + "/" + entry.name)
+            } else {
+                total += entry.size
+            }
+        }
+        return total
+    }
+
     /// Recursively copies an ISO directory into the image, preserving on-disc
     /// order and streaming file bytes in the builder's ≤4 MiB chunks so a
-    /// 600 MB ISO's CABs never sit in memory whole.
-    private func copyTree(from iso: ISO9660Image, isoPath: String, imagePath: String) throws {
+    /// 600 MB ISO's CABs never sit in memory whole. `onFileCopied` fires once
+    /// per completed FILE with its byte count (directories report nothing).
+    private func copyTree(from iso: ISO9660Image, isoPath: String, imagePath: String,
+                          onFileCopied: (Int) -> Void = { _ in }) throws {
         try addDirectory(path: imagePath)
         for entry in try iso.list(directory: isoPath) {
             // PVD identifiers are uppercase 8.3 by construction, but a few
@@ -598,11 +624,13 @@ extension FAT16ImageBuilder {
             let childISO = isoPath + "/" + entry.name
             let childImage = imagePath + "/" + entry.name.uppercased()
             if entry.isDirectory {
-                try copyTree(from: iso, isoPath: childISO, imagePath: childImage)
+                try copyTree(from: iso, isoPath: childISO, imagePath: childImage,
+                             onFileCopied: onFileCopied)
             } else {
                 try addFile(path: childImage, size: entry.size) { offset, count in
                     try iso.readFile(atPath: childISO, offset: offset, count: count)
                 }
+                onFileCopied(entry.size)
             }
         }
     }

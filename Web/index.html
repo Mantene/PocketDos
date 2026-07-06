@@ -585,6 +585,60 @@
       startDos(URL.createObjectURL(new Blob([u8])), null, "dosboxX");
     }
 
+    // ---- Install-mode boot (Win98 wizard, gated on ?insttarget=<base>) ----
+    // Boots the wizard-built install media with the conf PROVEN in the Chrome
+    // spike (wizard-s0 runInstSpike): the CD's patched El Torito boot floppy as
+    // A:, the blank target sockdrive as first HDD (imgmount 2 → guest C:), the
+    // WIN98-CAB source sockdrive as second HDD (imgmount 3 → guest D:) — so real
+    // IO.SYS assigns letters from the MBRs and the floppy's AUTOEXEC runs Setup
+    // unattended. &instboot=c re-boots the (now-installed) target for phase 2;
+    // with no &instfloppy that drops the floppy mount entirely.
+    // Progress breadcrumbs go out as "[pdos-install]" console lines (phase,
+    // ci-ready, any engine [panic]): the native wizard parses them off the
+    // existing console bridge to drive its progress UI.
+    async function bootInstall(targetBase, srcBase, floppyZipUrl, instBoot) {
+      const bootDrive = instBoot === "c" ? "boot c:" : "boot a:";
+      log("[pdos-install] phase=" + (instBoot === "c" ? "boot-c" : "boot-a") +
+          " target=" + targetBase + " src=" + (srcBase || "none") +
+          " floppy=" + (floppyZipUrl ? "yes" : "no"));
+      // Re-emit engine panics under the install prefix so the native side sees
+      // FAILURE on the same channel it watches for progress, not just silence.
+      const origError = console.error.bind(console);
+      console.error = function () {
+        origError.apply(null, arguments);
+        try {
+          const text = Array.prototype.join.call(arguments, " ");
+          if (text.indexOf("[panic]") >= 0) console.log("[pdos-install] " + text);
+        } catch (e) { /* breadcrumbs must never break the boot */ }
+      };
+      window.__pdosInstall = true;          // startDos logs [pdos-install] ci-ready
+      window.__pdosSockBase = targetBase;   // persist() capture points at the TARGET
+      const bundle = await emulators.bundle();
+      let conf = setMemsize(bundle.dosboxConf, 64);
+      conf = setConf(conf, "autolock", "false", "sdl");
+      conf = setConf(conf, "mouse_emulation", "integration", "sdl");
+      conf = setConf(conf, "integration device", "true", "cpu");
+      // Disable the emulated NE2000 NIC: with a card present Win98 auto-installs
+      // the whole TCP/IP stack from the (absent) CD → an endless "Insert Disk"
+      // nag loop and dangling vnetbios.vxd refs. A game box needs zero
+      // networking, so present NO card → no network components at all.
+      conf = setConf(conf, "ne2000", "false", "ne2000");
+      const cut = conf.search(/^\[autoexec\]/im);
+      if (cut >= 0) conf = conf.slice(0, cut);
+      conf += "[autoexec]\necho off\n" +
+              // The floppy zip (containing exactly boot.img) extracts into the
+              // bundle root, which `mount c .` exposes — so imgmount can reach
+              // it. Phase-2 boots without a floppy skip all three lines.
+              (floppyZipUrl ? "mount c .\nc:\nimgmount a: boot.img -U\n" : "") +
+              "imgmount 2 sockdrive " + targetBase + "\n" +
+              (srcBase && srcBase !== "none" ? "imgmount 3 sockdrive " + srcBase + "\n" : "") +
+              bootDrive + "\n";
+      bundle.dosboxConf = conf;
+      if (floppyZipUrl) bundle.extract(floppyZipUrl);
+      const u8 = await bundle.toUint8Array();
+      startDos(URL.createObjectURL(new Blob([u8])), null, "dosboxX");
+    }
+
     async function spikeMeasure(ci, sizeMB) {
       const MB = 1048576;
       try {
@@ -646,6 +700,7 @@
             window.ci = arg;
             const t = sockMs();
             log("running — ci-ready" + (t !== null ? " [sockspike +" + t + "ms to ci-ready]" : ""));
+            if (window.__pdosInstall) console.log("[pdos-install] ci-ready");
             if (window.__spikeSizeMB) spikeMeasure(arg, window.__spikeSizeMB);
             if (PDOS_DEBUG || SHOW_FPS) {
               // True emulator output rate: count frames the engine pushes. onFrame is
@@ -708,8 +763,15 @@
     const PARAM_IMGTEST = new URLSearchParams(location.search).get("imgtest");  // DEBUG: disk-image feasibility spike
     const PARAM_SOCKSPIKE = new URLSearchParams(location.search).get("sockspike");  // DEBUG: sockdrive boot-speed spike (<base>)
     const PARAM_WRITESPIKE = new URLSearchParams(location.search).get("writespike");  // DEBUG: sockdrive write-load OOM spike (<base>)
+    const PARAM_INSTTARGET = new URLSearchParams(location.search).get("insttarget");  // install wizard: blank-target sockdrive (<base>)
+    const PARAM_INSTSRC = new URLSearchParams(location.search).get("instsrc");        // install wizard: WIN98-CAB source sockdrive (<base>)
+    const PARAM_INSTFLOPPY = new URLSearchParams(location.search).get("instfloppy");  // install wizard: boot-floppy zip URL (contains boot.img)
+    const PARAM_INSTBOOT = new URLSearchParams(location.search).get("instboot");      // install wizard: "c" = phase-2, boot the target
 
-    if (PARAM_DRIVE) {
+    if (PARAM_INSTTARGET) {
+      // Win98 install wizard (see bootInstall); takes priority over ?drive=.
+      bootInstall(PARAM_INSTTARGET, PARAM_INSTSRC, PARAM_INSTFLOPPY, PARAM_INSTBOOT);
+    } else if (PARAM_DRIVE) {
       // Production sockdrive game (see bootFromSockdrive); bypasses the zip-bundle load.
       bootFromSockdrive(PARAM_DRIVE, PARAM_MEM ? parseInt(PARAM_MEM, 10) : 64, PARAM_RESTORE);
     } else if (PARAM_IMGTEST) {
