@@ -451,6 +451,12 @@
         };
       });
     }
+
+    // Install-wizard stage-loop hook: the orchestrator (native Swift, or the
+    // Chrome prototype) re-seeds the PREVIOUS stage's captured sector-diff
+    // BEFORE any drive mounts. Callable pre-boot — pair with ?instwait=1,
+    // which parks the boot behind window.pdosInstallGo().
+    window.pdosReseed = function (base, u8) { return reseedSockdriveWrites(base, u8); };
     // -----------------------------------------------------------------------
 
     // ---- Tier-0 disk-image feasibility spike (DEBUG, gated on ?imgtest=<MB>) --
@@ -767,10 +773,22 @@
     const PARAM_INSTSRC = new URLSearchParams(location.search).get("instsrc");        // install wizard: WIN98-CAB source sockdrive (<base>)
     const PARAM_INSTFLOPPY = new URLSearchParams(location.search).get("instfloppy");  // install wizard: boot-floppy zip URL (contains boot.img)
     const PARAM_INSTBOOT = new URLSearchParams(location.search).get("instboot");      // install wizard: "c" = phase-2, boot the target
+    const PARAM_INSTWAIT = new URLSearchParams(location.search).get("instwait");      // install wizard: park the boot behind window.pdosInstallGo()
 
     if (PARAM_INSTTARGET) {
       // Win98 install wizard (see bootInstall); takes priority over ?drive=.
-      bootInstall(PARAM_INSTTARGET, PARAM_INSTSRC, PARAM_INSTFLOPPY, PARAM_INSTBOOT);
+      // With &instwait=1 the boot is parked behind window.pdosInstallGo() so the
+      // stage-loop orchestrator can pdosReseed the previous stage's captured
+      // writes into IndexedDB BEFORE the sockdrive client mounts (mount is when
+      // it reads the write store — reseeding after is too late).
+      const startInstall = () =>
+        bootInstall(PARAM_INSTTARGET, PARAM_INSTSRC, PARAM_INSTFLOPPY, PARAM_INSTBOOT);
+      if (PARAM_INSTWAIT) {
+        window.pdosInstallGo = startInstall;
+        console.log("[pdos-install] waiting for go");
+      } else {
+        startInstall();
+      }
     } else if (PARAM_DRIVE) {
       // Production sockdrive game (see bootFromSockdrive); bypasses the zip-bundle load.
       bootFromSockdrive(PARAM_DRIVE, PARAM_MEM ? parseInt(PARAM_MEM, 10) : 64, PARAM_RESTORE);
