@@ -158,6 +158,18 @@ enum InstallMediaBuilder {
     /// auto-apply is proven NOT to work (LEG 8). /IS skips ScanDisk, which
     /// would otherwise halt on our synthetic source volume.
     ///
+    /// ONE-SHOT guard (`A:\PDOSRAN.FLG`): Setup's phase-1 ends in a guest
+    /// reboot, and DOSBox's `boot a:` puts the SAME floppy back — without a
+    /// guard, Setup restarts from scratch (the LEG 7/8 loop). The floppy is a
+    /// writable MEMFS image, so a flag dropped just before the Setup line
+    /// survives the in-page guest reboot: pass 2 sees it, jumps to :DONE, and
+    /// idles at an A:\> banner writing NOTHING to C: — a stable parking state
+    /// the native orchestrator can take as its boot-switch signal (reload with
+    /// `instboot=c`). A page reload rebuilds the floppy from the bundle, so
+    /// the flag never leaks into a fresh install run. The flag lives on A:
+    /// (never C:) and the running batch keeps its own name — COMMAND.COM
+    /// re-reads AUTOEXEC.BAT by name per line.
+    ///
     /// CRLF + Latin-1, like everything DOS parses.
     static let unattendedAutoexec: Data = dosText([
         "@ECHO OFF",
@@ -167,10 +179,14 @@ enum InstallMediaBuilder {
         "set temp=c:\\",
         "set tmp=c:\\",
         "path=a:\\",
+        "IF EXIST A:\\PDOSRAN.FLG GOTO DONE",
         "echo.",
         "echo PocketDOS: starting UNATTENDED Windows 98 Setup (MSBATCH.INF)...",
         "echo.",
+        "echo x > A:\\PDOSRAN.FLG",
         "D:\\WIN98\\SETUP.EXE D:\\MSBATCH.INF /IS",
+        ":DONE",
+        "@echo PocketDOS: phase-1 complete, awaiting boot-switch.",
     ])
 
     /// CONFIG.SYS replacement: the CDBOOT floppy's stock CONFIG.SYS is a

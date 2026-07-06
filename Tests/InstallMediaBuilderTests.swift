@@ -225,6 +225,22 @@ final class InstallMediaBuilderTests: XCTestCase {
         XCTAssertTrue(autoexecText.contains("D:\\WIN98\\SETUP.EXE D:\\MSBATCH.INF /IS\r\n"))
         XCTAssertFalse(autoexecText.contains("setramd"),
                        "EBD ramdrive plumbing must not be on the CDBOOT floppy")
+
+        // One-shot guard: the flag test must come first, the flag write must
+        // land before Setup launches (so the post-phase-1 reboot re-entry is
+        // caught even though Setup never returns), and pass 2 must park at
+        // the :DONE banner without touching Setup.
+        let guardRange = autoexecText.range(of: "IF EXIST A:\\PDOSRAN.FLG GOTO DONE\r\n")
+        let flagWrite = autoexecText.range(of: "echo x > A:\\PDOSRAN.FLG\r\n")
+        let setupLine = autoexecText.range(of: "D:\\WIN98\\SETUP.EXE")
+        XCTAssertNotNil(guardRange); XCTAssertNotNil(flagWrite); XCTAssertNotNil(setupLine)
+        XCTAssertTrue(guardRange!.upperBound <= flagWrite!.lowerBound,
+                      "the guard must run before the flag is dropped")
+        XCTAssertTrue(flagWrite!.upperBound <= setupLine!.lowerBound,
+                      "the flag must exist before Setup can trigger a reboot")
+        XCTAssertTrue(autoexecText.hasSuffix(
+            ":DONE\r\n@echo PocketDOS: phase-1 complete, awaiting boot-switch.\r\n"),
+            "pass 2 must end parked at the phase-1-complete banner")
         let entry = FAT12FloppyFixture.rootOffset + 3 * 32
         XCTAssertEqual(Int(floppy[entry + 28]) | Int(floppy[entry + 29]) << 8, autoexec.count)
 
