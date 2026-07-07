@@ -115,6 +115,24 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertEqual(d.ingest(301_000), .plateau)    // tick 4
     }
 
+    func testDetectorTracksGrowthSinceFirstAcceptedCapture() {
+        // Stage 2's death classifier reads "how much did Setup actually do"
+        // straight off the detector: the first accepted capture reports the
+        // re-seeded checkpoint, so growth is genuinely new work.
+        var d = CapturePlateauDetector()
+        XCTAssertEqual(d.growthSinceFirstAccepted, 0, "no captures yet")
+        _ = d.ingest(388_979)                          // the seeded checkpoint
+        XCTAssertEqual(d.firstAccepted, 388_979)
+        XCTAssertEqual(d.growthSinceFirstAccepted, 0)
+        _ = d.ingest(388_979)                          // idle wizard ticks
+        XCTAssertEqual(d.growthSinceFirstAccepted, 0)
+        _ = d.ingest(401_690)                          // Setup wrote
+        XCTAssertEqual(d.growthSinceFirstAccepted, 12_711)
+        _ = d.ingest(150_000)                          // rejected partial persist
+        XCTAssertEqual(d.firstAccepted, 388_979, "rejects must not move the baseline")
+        XCTAssertEqual(d.growthSinceFirstAccepted, 12_711)
+    }
+
     // MARK: - Stage/retry state machine
 
     func testFlowBeginsByBootingStage1() {
@@ -151,23 +169,33 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertEqual(flow.stage, .stage2)
     }
 
-    func testStage2DeathIsTheExpectedTransitionToStage3() {
+    /// Evidence that unambiguously reads as Windows' finalize shutdown.
+    private let finalizeShapedDeath = Stage2DeathEvidence(runtime: 14 * 60,
+                                                          captureGrowth: 60_000)
+    /// Evidence shaped like the device run's OOM: seconds in, nothing written.
+    private let earlyCrashDeath = Stage2DeathEvidence(runtime: 75, captureGrowth: 0)
+
+    private func flowAtStage2() -> InstallFlow {
         var flow = InstallFlow()
         _ = flow.begin(); flow.bootSucceeded()
         _ = flow.stageEnded()          // → stage 2
         flow.bootSucceeded()
+        return flow
+    }
+
+    func testStage2DeathIsTheExpectedTransitionToStage3() {
+        var flow = flowAtStage2()
         // "Windows is shutting down" kills the WASM: NOT a failure, and it
-        // must not draw on the recovery budget.
-        XCTAssertEqual(flow.died(), .bootStage(.stage3, attempt: 1))
+        // must not draw on the recovery budget — but only a death whose
+        // evidence looks like real Setup work counts.
+        XCTAssertEqual(flow.died(stage2Evidence: finalizeShapedDeath),
+                       .bootStage(.stage3, attempt: 1))
         XCTAssertEqual(flow.recoveryBoots, 0)
     }
 
     func testStage3DeathsRetryThenExhaustTheRecoveryBudget() {
-        var flow = InstallFlow()
-        _ = flow.begin(); flow.bootSucceeded()
-        _ = flow.stageEnded()          // → stage 2
-        flow.bootSucceeded()
-        _ = flow.died()                // → stage 3 (expected)
+        var flow = flowAtStage2()
+        _ = flow.died(stage2Evidence: finalizeShapedDeath)   // → stage 3 (expected)
         flow.bootSucceeded()
         XCTAssertEqual(flow.died(), .bootStage(.stage3, attempt: 1))   // recovery 1
         XCTAssertEqual(flow.died(), .bootStage(.stage3, attempt: 1))   // recovery 2
@@ -187,13 +215,80 @@ final class InstallOrchestratorTests: XCTestCase {
     }
 
     func testStage3PlateauIsTheFinalizeSignal() {
-        var flow = InstallFlow()
-        _ = flow.begin(); flow.bootSucceeded()
-        _ = flow.stageEnded()          // → stage 2
-        flow.bootSucceeded()
-        _ = flow.died()                // → stage 3
+        var flow = flowAtStage2()
+        _ = flow.died(stage2Evidence: finalizeShapedDeath)   // → stage 3
         flow.bootSucceeded()
         XCTAssertEqual(flow.stageEnded(), .finalizeReady)
+    }
+
+    // MARK: - Stage-2 death classification (device fix 1)
+
+    func testStage2EarlyDeathRetriesStage2OnTheRecoveryBudget() {
+        // The device run: WebContent OOM ~3 captures into GUI Setup. That is
+        // NOT the finalize restart — stage 2 must re-boot (re-seed + re-run
+        // the script), and it costs a recovery slot.
+        var flow = flowAtStage2()
+        XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath),
+                       .bootStage(.stage2, attempt: 1))
+        XCTAssertEqual(flow.stage, .stage2)
+        XCTAssertEqual(flow.recoveryBoots, 1)
+    }
+
+    func testStage2DeathClassifiesByRuntimeAlone() {
+        // Past 8 minutes the shutdown story holds even if the growth arm
+        // stayed quiet (e.g. the checkpoint already contained the copies).
+        var flow = flowAtStage2()
+        let evidence = Stage2DeathEvidence(runtime: 8 * 60 + 1, captureGrowth: 0)
+        XCTAssertTrue(evidence.indicatesFinalizeRestart)
+        XCTAssertEqual(flow.died(stage2Evidence: evidence), .bootStage(.stage3, attempt: 1))
+        XCTAssertEqual(flow.recoveryBoots, 0)
+    }
+
+    func testStage2DeathClassifiesByGrowthAlone() {
+        // Heavy writes prove Setup did real copy/hardware work regardless of
+        // how fast the clock ran.
+        var flow = flowAtStage2()
+        let evidence = Stage2DeathEvidence(runtime: 60, captureGrowth: 10_001)
+        XCTAssertTrue(evidence.indicatesFinalizeRestart)
+        XCTAssertEqual(flow.died(stage2Evidence: evidence), .bootStage(.stage3, attempt: 1))
+        XCTAssertEqual(flow.recoveryBoots, 0)
+    }
+
+    func testStage2DeathThresholdsAreStrictlyGreaterThan() {
+        // Exactly AT both thresholds is still an early death (> not >=).
+        let boundary = Stage2DeathEvidence(runtime: 8 * 60, captureGrowth: 10_000)
+        XCTAssertFalse(boundary.indicatesFinalizeRestart)
+        var flow = flowAtStage2()
+        XCTAssertEqual(flow.died(stage2Evidence: boundary), .bootStage(.stage2, attempt: 1))
+        XCTAssertEqual(flow.recoveryBoots, 1)
+    }
+
+    func testStage2DeathWithoutEvidenceIsTreatedAsEarly() {
+        // nil evidence must fall on the SAFE side: retry, don't advance.
+        var flow = flowAtStage2()
+        XCTAssertEqual(flow.died(), .bootStage(.stage2, attempt: 1))
+        XCTAssertEqual(flow.recoveryBoots, 1)
+    }
+
+    func testStage2EarlyDeathsExhaustTheSharedRecoveryBudget() {
+        var flow = flowAtStage2()
+        XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath), .bootStage(.stage2, attempt: 1))
+        XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath), .bootStage(.stage2, attempt: 1))
+        XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath), .bootStage(.stage2, attempt: 1))
+        guard case .failed = flow.died(stage2Evidence: earlyCrashDeath) else {
+            return XCTFail("the fourth early stage-2 crash must fail the install")
+        }
+    }
+
+    func testStage2RetryStillAllowsTheLaterFinalizeTransition() {
+        // Early crash → retry → the re-run's REAL finalize death still moves
+        // to stage 3 without further budget draw.
+        var flow = flowAtStage2()
+        _ = flow.died(stage2Evidence: earlyCrashDeath)   // recovery 1
+        flow.bootSucceeded()
+        XCTAssertEqual(flow.died(stage2Evidence: finalizeShapedDeath),
+                       .bootStage(.stage3, attempt: 1))
+        XCTAssertEqual(flow.recoveryBoots, 1)
     }
 
     // MARK: - Injected JS builders
@@ -228,6 +323,75 @@ final class InstallOrchestratorTests: XCTestCase {
     func testQuotedEscapesHostileCharacters() {
         XCTAssertEqual(InstallJS.quoted(#"a"b\c"#), #""a\"b\\c""#)
         XCTAssertEqual(InstallJS.quoted("x\ny"), #""x\ny""#)
+    }
+
+    func testLogBreadcrumbJSWritesAnInstallPrefixedConsoleLine() {
+        XCTAssertEqual(InstallJS.logBreadcrumb("script-cycle 3"),
+                       #"console.log("[pdos-install] script-cycle 3");"#)
+        // The native-emitted forensic tails round-trip through the console
+        // bridge — they must stay INFORMATIONAL to the parser, never events.
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] script-cycle 3"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] desktop-probe flat"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] desktop-probe grew"))
+    }
+
+    // MARK: - Stage-2 keystroke loop (device fix 2)
+
+    func testSetupScriptCycleIsTheEnterChordEnterPattern() {
+        // The timing-immune repeat-cycle: Enter advances pre-filled pages
+        // (disabled Next no-ops), Alt+A then Enter clears License. Stray
+        // extras are safe by design, so the SAME cycle fits every page.
+        XCTAssertEqual(SetupScript.cycle, [
+            .press(js: InstallJS.pressEnter), .wait(seconds: 8),
+            .press(js: InstallJS.pressAltA), .wait(seconds: 1.5),
+            .press(js: InstallJS.pressEnter), .wait(seconds: 8),
+        ])
+        XCTAssertEqual(InstallJS.pressEnter, "window.ci && window.ci.simulateKeyPress(257)")
+        XCTAssertEqual(InstallJS.pressAltA, "window.ci && window.ci.simulateKeyPress(342, 65)")
+        XCTAssertEqual(SetupScript.leadInSeconds, 60)
+        XCTAssertEqual(SetupScript.maxCycles, 12, "hard cap — the loop must not run forever")
+    }
+
+    func testSetupScriptExitConditionIsStrictCaptureGrowth() {
+        // The loop exits on EVIDENCE, not time: captures must grow past
+        // +3,000 sectors (strictly) over the loop-start baseline before the
+        // script hands over to the unattended watcher.
+        XCTAssertFalse(SetupScript.hasAdvanced(baseline: 388_979, latest: 388_979))
+        XCTAssertFalse(SetupScript.hasAdvanced(baseline: 388_979, latest: 388_979 + 3_000))
+        XCTAssertTrue(SetupScript.hasAdvanced(baseline: 388_979, latest: 388_979 + 3_001))
+    }
+
+    // MARK: - Stage-3 desktop probe (device fix 3)
+
+    func testDesktopProbeCycleShape() {
+        XCTAssertEqual(DesktopProbe.cycle, [
+            .press(js: InstallJS.pressEnter), .wait(seconds: 2),
+            .press(js: InstallJS.pressAltA), .wait(seconds: 1.5),
+            .press(js: InstallJS.pressEnter),
+        ])
+        XCTAssertEqual(DesktopProbe.settleTicks, 3)
+        XCTAssertEqual(DesktopProbe.maxProbes, 3)
+    }
+
+    func testDesktopProbeFlatConfirmsDesktopAndGrowthMeansWizard() {
+        // The device run's failure shape: stage 3 plateaued at 401,690 on a
+        // WAITING wizard page. A real desktop swallows the probe keys with
+        // zero writes (flat); a wizard page advances and writes (grew).
+        XCTAssertTrue(DesktopProbe.isFlat(baseline: 401_690, latest: 401_690),
+                      "flat probe = desktop confirmed = done")
+        XCTAssertFalse(DesktopProbe.isFlat(baseline: 401_690, latest: 401_691),
+                       "ANY growth = the probe advanced a live page = keep watching")
+    }
+
+    // MARK: - Overlay header (capture-loop floor source)
+
+    func testSockdriveOverlayRecordCountReadsU32LEHeader() {
+        XCTAssertEqual(sockdriveOverlayRecordCount(Data([0x01, 0x02, 0x03, 0x04])),
+                       0x04030201, "u32le at byte 0 — the capture loop's exact read")
+        XCTAssertEqual(sockdriveOverlayRecordCount(Data([0x33, 0xEF, 0x05, 0x00, 0xFF])),
+                       388_915, "trailing bytes are ignored")
+        XCTAssertNil(sockdriveOverlayRecordCount(Data([0x01, 0x02, 0x03])),
+                     "short headers are unreadable, not zero")
     }
 
     // MARK: - Final game shape (meta.json)

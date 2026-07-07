@@ -166,7 +166,8 @@ struct InstallProgressView: View {
         case .stage2Script(let step):
             switch step {
             case 0: return "Waiting for Setup's first page…"
-            case 1...5: return "Answering Setup's questions automatically (step \(step) of 5)."
+            case 1...SetupScript.maxCycles:
+                return "Answering Setup's questions automatically (pass \(step))."
             default: return "Hardware detection and configuration — roughly 11-15 minutes. "
                           + "The screen going black partway through is expected."
             }

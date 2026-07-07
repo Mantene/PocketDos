@@ -13,13 +13,18 @@ struct InstallError: Error {
 
 /// Drives one complete Windows 98 install, end to end, against the app's ONE
 /// shared WKWebView: media build → stage 1 (floppy boot, unattended file
-/// copy) → stage 2 (boot C:, five scripted keystrokes, unattended hardware
-/// setup, expected WASM death at Windows' first shutdown) → stage 3 (recovery
-/// boot to the desktop) → mouse-driver surgery + library registration.
+/// copy) → stage 2 (boot C:, repeated keystroke cycles until the captures
+/// show Setup advanced, unattended hardware setup, expected WASM death at
+/// Windows' first shutdown — an EARLY death is a crash and re-runs the
+/// stage) → stage 3 (recovery boot; each write plateau is probed with a
+/// keystroke cycle and only a FLAT probe counts as the desktop) →
+/// mouse-driver surgery + library registration.
 ///
-/// The mechanics and timings are the Chrome-proven runbook ported 1:1; the
-/// pure decision pieces (breadcrumb grammar, plateau rule, stage/retry
-/// machine) live in InstallFlow.swift where they are unit-tested.
+/// The mechanics are the Chrome-proven runbook, made timing-immune after the
+/// first device run (device Setup paints far slower than Chrome); the pure
+/// decision pieces (breadcrumb grammar, plateau rule, stage/retry machine,
+/// death classification, script/probe shapes) live in InstallFlow.swift
+/// where they are unit-tested.
 ///
 /// It observes the install page through the EXISTING console bridge — via the
 /// additive `EmulatorController.onConsoleLine` hook — and through
@@ -36,8 +41,9 @@ final class InstallOrchestrator: ObservableObject {
         case idle
         case buildingMedia(percent: Int)
         case stage1FileCopy(captureCount: Int)
-        /// `step` = scripted keystrokes sent so far (0 = waiting for Setup's
-        /// first page, 5 = all sent, 6 = unattended hardware setup running).
+        /// `step` = keystroke cycles started so far (0 = lead-in before the
+        /// first cycle, 1...maxCycles = that cycle running, maxCycles+1 =
+        /// Setup advanced / unattended hardware setup running).
         case stage2Script(step: Int)
         /// Recovery boot through final capture pull.
         case stage3Finalizing
@@ -78,16 +84,12 @@ final class InstallOrchestrator: ObservableObject {
         case .stage3: return 12 * 60
         }
     }
-    /// Setup wizard keystrokes, as offsets FROM THE GO CALL (stage 2). The
-    /// codes are js-dos key codes; timings are the runbook's, deliberately
-    /// generous versus what the Chrome run observed.
-    static let setupScript: [(offset: TimeInterval, js: String)] = [
-        (75, InstallJS.pressEnter),   // User Information → Next
-        (83, InstallJS.pressAltA),    // License → "I accept" (Alt+A)
-        (85, InstallJS.pressEnter),   // License → Next
-        (97, InstallJS.pressEnter),   // Product key (pre-filled) → Next
-        (127, InstallJS.pressEnter),  // Start Windows 98 Setup wizard / Finish
-    ]
+    /// How long a stage-3 desktop probe waits for its settle ticks before
+    /// comparing counts anyway (nominal is settleTicks × 4.5 s; the in-page
+    /// persist can stall far longer under load).
+    static let probeSettleTimeout: TimeInterval = 45
+    // Stage 2's keystroke cycles and stage 3's desktop probe are pure data:
+    // SetupScript / DesktopProbe in InstallFlow.swift.
 
     // MARK: - Run wiring
 
@@ -388,16 +390,23 @@ final class InstallOrchestrator: ObservableObject {
                     continue
                 }
                 flow.bootSucceeded()
-                armCaptureLoop(shared: shared)
+                armCaptureLoop(shared: shared, floor: captureFloor(for: stage, folder: folder))
                 if stage == .stage2 {
                     let diedDuringScript = try await runSetupScript(shared: shared)
                     if diedDuringScript {
                         try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
-                        next = flow.died()
+                        next = flow.died(stage2Evidence: stage2DeathEvidence())
                         continue
                     }
                 }
-                switch try await watchStage(stage) {
+                let outcome: StageOutcome
+                if stage == .stage3 {
+                    outcome = try await watchStage3ToDesktop(shared: shared)
+                } else {
+                    outcome = try await watchStage(
+                        stage, until: Date().addingTimeInterval(Self.stageDeadline(stage)))
+                }
+                switch outcome {
                 case .plateau:
                     if stage == .stage3 {
                         state = .stage3Finalizing
@@ -413,7 +422,8 @@ final class InstallOrchestrator: ObservableObject {
                     // __lastGood is ≤4.5 s old. After a process kill this
                     // throws and the previous checkpoint stands.
                     try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
-                    next = flow.died()
+                    next = flow.died(
+                        stage2Evidence: stage == .stage2 ? stage2DeathEvidence() : nil)
                 }
             }
         }
@@ -471,33 +481,114 @@ final class InstallOrchestrator: ObservableObject {
         eventQueue.removeAll()   // stale events die with the page they came from
     }
 
-    private func armCaptureLoop(shared: SharedEmulator) {
+    private func armCaptureLoop(shared: SharedEmulator, floor: Int) {
         stageDetector = CapturePlateauDetector()
         plateauSeen = false
         lastCaptureAt = Date()
         shared.webView.evaluateJavaScript(
-            InstallJS.captureLoop(targetBase: targetBase, floor: captureHighWater),
+            InstallJS.captureLoop(targetBase: targetBase, floor: floor),
             completionHandler: nil)
     }
 
-    /// Stage 2's five keystrokes, timed from the go call. Returns true if the
-    /// engine died mid-script (early death → recovery, skipping the rest).
-    private func runSetupScript(shared: SharedEmulator) async throws -> Bool {
-        for (index, step) in Self.setupScript.enumerated() {
-            state = .stage2Script(step: index)
-            let fireAt = goAt.addingTimeInterval(step.offset)
-            while Date() < fireAt {
-                try Task.checkCancellation()
-                if let event = await awaitEvent(timeout: max(0.1, fireAt.timeIntervalSinceNow)) {
-                    apply(event)
-                }
-                if deathSeen { return true }
-            }
-            shared.webView.evaluateJavaScript(step.js, completionHandler: nil)
-            state = .stage2Script(step: index + 1)
+    /// The monotonic floor injected into this boot's capture loop: the record
+    /// count of the checkpoint the page just re-seeded (stage 2/3 boots read
+    /// it straight off stage.bin's header), NOT the run's global high water.
+    /// A stage-2 retry deliberately restores an OLDER checkpoint — flooring
+    /// at the high water would make the page drop every persist as regressed
+    /// (no accepted captures, no live re-seed, and a spurious silence death)
+    /// until Setup re-crossed the stale mark. Stage 1 has no checkpoint yet;
+    /// unreadable headers fall back to the conservative high water.
+    private func captureFloor(for stage: InstallFlow.Stage, folder: URL) -> Int {
+        guard stage != .stage1 else { return captureHighWater }
+        guard let handle = try? FileHandle(forReadingFrom: stageBinFileURL(folder)) else {
+            return captureHighWater
         }
-        state = .stage2Script(step: Self.setupScript.count + 1)   // unattended hardware setup
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 4), header.count == 4,
+              let count = sockdriveOverlayRecordCount(header) else {
+            return captureHighWater
+        }
+        return count
+    }
+
+    /// What stage 2 actually did before dying — read at death time, fed to
+    /// the flow's classifier. Runtime counts from the go release; growth
+    /// counts from this boot's first accepted capture (which reports the
+    /// re-seeded checkpoint's count, so growth is genuinely new work).
+    private func stage2DeathEvidence() -> Stage2DeathEvidence {
+        Stage2DeathEvidence(runtime: Date().timeIntervalSince(goAt),
+                            captureGrowth: stageDetector.growthSinceFirstAccepted)
+    }
+
+    /// Stage 2's keystroke phase, timing-immune (the fixed-delay table died
+    /// on device: Setup paints far slower there than in Chrome). After a
+    /// quiet lead-in, keystroke cycles repeat — each safe wherever Setup
+    /// happens to be — until the captures prove Setup advanced into its
+    /// copy/hardware work, the cycle cap runs out, or the engine dies.
+    /// Returns true if the engine died mid-script.
+    private func runSetupScript(shared: SharedEmulator) async throws -> Bool {
+        state = .stage2Script(step: 0)
+        if try await drain(until: goAt.addingTimeInterval(SetupScript.leadInSeconds)) { return true }
+        let baseline = captureHighWater
+        for cycle in 1...SetupScript.maxCycles {
+            state = .stage2Script(step: cycle)
+            emitBreadcrumb("script-cycle \(cycle)", shared: shared)
+            if try await perform(cycle: SetupScript.cycle, shared: shared) { return true }
+            if SetupScript.hasAdvanced(baseline: baseline, latest: captureHighWater) { break }
+        }
+        state = .stage2Script(step: SetupScript.maxCycles + 1)   // unattended hardware setup
         return false
+    }
+
+    /// Interprets one keystroke cycle (SetupScript.cycle / DesktopProbe.cycle)
+    /// Swift-side, draining events through the waits. True = death seen.
+    private func perform(cycle: [ScriptStep], shared: SharedEmulator) async throws -> Bool {
+        for step in cycle {
+            if deathSeen { return true }
+            switch step {
+            case .press(let js):
+                shared.webView.evaluateJavaScript(js, completionHandler: nil)
+            case .wait(let seconds):
+                if try await drain(until: Date().addingTimeInterval(seconds)) { return true }
+            }
+        }
+        return deathSeen
+    }
+
+    /// Drains install events until `deadline`. True = death seen (early out).
+    private func drain(until deadline: Date) async throws -> Bool {
+        while Date() < deadline {
+            try Task.checkCancellation()
+            if deathSeen { return true }
+            if let event = await awaitEvent(timeout: max(0.1, deadline.timeIntervalSinceNow)) {
+                apply(event)
+            }
+        }
+        return deathSeen
+    }
+
+    /// Waits for `ticks` accepted captures (nominally ticks × 4.5 s), bounded
+    /// by `probeSettleTimeout` in case the in-page persist stalls. True =
+    /// death seen.
+    private func awaitCaptureTicks(_ ticks: Int) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(Self.probeSettleTimeout)
+        var seen = 0
+        while seen < ticks, Date() < deadline {
+            try Task.checkCancellation()
+            if deathSeen { return true }
+            if let event = await awaitEvent(timeout: max(0.1, deadline.timeIntervalSinceNow)) {
+                if case .captured = event { seen += 1 }
+                apply(event)
+            }
+        }
+        return deathSeen
+    }
+
+    /// Best-effort forensic breadcrumb INTO the page console, so native-
+    /// driven moves (script cycles, probe verdicts) interleave with the
+    /// page's own `captured` lines in one pullable log stream.
+    private func emitBreadcrumb(_ tail: String, shared: SharedEmulator) {
+        shared.webView.evaluateJavaScript(InstallJS.logBreadcrumb(tail), completionHandler: nil)
     }
 
     private enum StageOutcome { case plateau, died }
@@ -505,9 +596,10 @@ final class InstallOrchestrator: ObservableObject {
     /// Supervises a booted stage until it settles or dies. Stage 2 never ends
     /// by plateau (the runbook's end there is death or plateau-THEN-silence,
     /// and equal-count captures keep arriving during a plateau, so the 5-min
-    /// silence watchdog is exactly the "then-silence" half).
-    private func watchStage(_ stage: InstallFlow.Stage) async throws -> StageOutcome {
-        let deadline = Date().addingTimeInterval(Self.stageDeadline(stage))
+    /// silence watchdog is exactly the "then-silence" half). The deadline is
+    /// the caller's so stage 3's probe loop can resume watching WITHOUT
+    /// restarting the stage clock.
+    private func watchStage(_ stage: InstallFlow.Stage, until deadline: Date) async throws -> StageOutcome {
         lastCaptureAt = Date()
         while true {
             try Task.checkCancellation()
@@ -516,6 +608,43 @@ final class InstallOrchestrator: ObservableObject {
             if Date().timeIntervalSince(lastCaptureAt) > Self.captureSilenceLimit { return .died }
             if Date() > deadline { return .died }
             if let event = await awaitEvent(timeout: 30) { apply(event) }
+        }
+    }
+
+    /// Stage 3's supervisor, device fix: a write plateau is no longer trusted
+    /// as "desktop reached" — the device run plateaued on a WAITING wizard
+    /// page and pulled a half-installed overlay. Each plateau is probed with
+    /// one keystroke cycle, then the counts get `DesktopProbe.settleTicks`
+    /// capture ticks to move: flat → the desktop really is idle → done;
+    /// grew → a wizard page ate the keys and advanced → resume watching for
+    /// the next plateau on the SAME stage deadline. At most
+    /// `DesktopProbe.maxProbes` probes per boot; after that the next plateau
+    /// is accepted (finalize's mouse-fix guard is the last backstop).
+    private func watchStage3ToDesktop(shared: SharedEmulator) async throws -> StageOutcome {
+        let deadline = Date().addingTimeInterval(Self.stageDeadline(.stage3))
+        var probes = 0
+        while true {
+            switch try await watchStage(.stage3, until: deadline) {
+            case .died:
+                return .died
+            case .plateau:
+                guard probes < DesktopProbe.maxProbes else { return .plateau }
+                probes += 1
+                let baseline = captureHighWater
+                if try await perform(cycle: DesktopProbe.cycle, shared: shared) { return .died }
+                if try await awaitCaptureTicks(DesktopProbe.settleTicks) { return .died }
+                if DesktopProbe.isFlat(baseline: baseline, latest: captureHighWater) {
+                    emitBreadcrumb("desktop-probe flat", shared: shared)
+                    return .plateau
+                }
+                emitBreadcrumb("desktop-probe grew", shared: shared)
+                // The keys advanced a live wizard page. Re-arm the plateau
+                // watch WITHOUT the growth requirement: the page's write
+                // burst may finish inside the settle wait we just spent, and
+                // the next plateau is probed (or budget-trusted) anyway.
+                stageDetector = CapturePlateauDetector(requireGrowth: false)
+                plateauSeen = false
+            }
         }
     }
 

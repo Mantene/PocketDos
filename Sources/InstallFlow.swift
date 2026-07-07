@@ -4,12 +4,16 @@ import Foundation
 // deterministic, WebView-free, and unit-tested. `InstallOrchestrator` is the
 // effectful interpreter that feeds these types real console lines and timers.
 //
-// The mechanics they encode are the Chrome-proven runbook (wizard-s0):
+// The mechanics they encode are the Chrome-proven runbook (wizard-s0),
+// hardened by the first device run:
 //   stage 1  boot the CD's floppy → unattended Setup phase-1 (file copy)
-//   stage 2  boot C: → Setup's info-collection pages driven by 5 scripted
-//            keystrokes → unattended hardware setup → guest shutdown KILLS
-//            the WASM (expected!)
-//   stage 3  recovery boot C: (no keystrokes) → desktop → final capture
+//   stage 2  boot C: → Setup's info-collection pages advanced by REPEATED
+//            keystroke cycles (device Setup paints far slower than Chrome —
+//            nothing is timed absolutely) → unattended hardware setup →
+//            guest shutdown KILLS the WASM (expected!). An EARLY death here
+//            is an engine crash, not the shutdown, and re-runs the stage.
+//   stage 3  recovery boot C: (hands-off) → desktop → final capture, with
+//            every write plateau PROBED before it is trusted as the desktop
 // with the install state carried between stages as the target sockdrive's
 // write-overlay blob, captured in-page via `ci.persist(true)` every 4.5 s and
 // re-seeded LIVE into IndexedDB (that re-seed is what lets warm reboots and
@@ -91,8 +95,18 @@ struct CapturePlateauDetector: Equatable {
     let requireGrowth: Bool
 
     private(set) var lastAccepted: Int?
+    private(set) var firstAccepted: Int?
     private(set) var consecutiveSame = 0
     private(set) var hasGrown = false
+
+    /// Sectors written since this detector's FIRST accepted capture — i.e.
+    /// since its stage boot. Stage 2's death classifier reads this as "how
+    /// much did Setup actually do this session" (the first accepted capture
+    /// reports the re-seeded checkpoint's count, so growth measures new work).
+    var growthSinceFirstAccepted: Int {
+        guard let first = firstAccepted, let last = lastAccepted else { return 0 }
+        return last - first
+    }
 
     init(minimumCount: Int = 300_000, plateauTicks: Int = 4, requireGrowth: Bool = true) {
         self.minimumCount = minimumCount
@@ -102,6 +116,7 @@ struct CapturePlateauDetector: Equatable {
 
     mutating func ingest(_ count: Int) -> Verdict {
         if let last = lastAccepted, count < last { return .rejected }
+        if firstAccepted == nil { firstAccepted = count }
         if let last = lastAccepted, count == last {
             consecutiveSame += 1
         } else {
@@ -118,6 +133,31 @@ struct CapturePlateauDetector: Equatable {
 
 // MARK: - Stage state machine
 
+/// What stage 2 accomplished before it died — the discriminator between the
+/// EXPECTED finalize restart (Windows' first shutdown kills the WASM at the
+/// end of hardware setup, 13-17 min in) and an early engine crash (the device
+/// run OOM-killed the WebContent process ~3 captures into GUI Setup, and
+/// misreading that as the finalize stranded stage 3 on an unadvanced wizard
+/// page). Either arm suffices: real Setup work takes TIME and writes HEAVILY,
+/// while a death on the wizard's opening pages shows neither.
+struct Stage2DeathEvidence: Equatable {
+    /// Seconds stage 2 ran (from its go release) before the death.
+    var runtime: TimeInterval
+    /// Sectors added since stage 2's first accepted capture this boot.
+    var captureGrowth: Int
+
+    /// The finalize shutdown lands 13-17 min in; the scripted wizard pages
+    /// never legitimately take 8. Strictly MORE is required.
+    static let finalizeMinRuntime: TimeInterval = 8 * 60
+    /// Wizard page flips write ~nothing; Setup's copy/hardware phases write
+    /// tens of thousands of sectors. Strictly MORE is required.
+    static let finalizeMinGrowth = 10_000
+
+    var indicatesFinalizeRestart: Bool {
+        runtime > Self.finalizeMinRuntime || captureGrowth > Self.finalizeMinGrowth
+    }
+}
+
 /// The stage-progression + retry authority. The orchestrator reports what
 /// happened (boot outcome, plateau, death) and this answers with the ONE next
 /// move, so the retry budgets live — and are tested — in one place.
@@ -125,10 +165,13 @@ struct CapturePlateauDetector: Equatable {
 /// Budgets, from the runbook:
 ///  - a stage load that never reaches ci-ready (90 s timeout or an instant
 ///    [panic]) is retried on the SAME stage, ≤3 attempts per boot episode;
-///  - a mid-stage death in stage 2 is EXPECTED (Windows' first shutdown kills
-///    the WASM) and transitions to stage 3 free of charge;
-///  - any other mid-stage death (stage 1, stage 3, or capture silence >5 min)
-///    re-boots that stage, drawing on a shared recovery budget of 3.
+///  - a mid-stage death in stage 2 WITH finalize-shaped evidence is EXPECTED
+///    (Windows' first shutdown kills the WASM) and transitions to stage 3
+///    free of charge;
+///  - any other mid-stage death (stage 1, stage 3, an EARLY stage-2 crash,
+///    or capture silence >5 min) re-boots that stage — for stage 2 that
+///    means re-seeding the checkpoint and RE-RUNNING the keystroke script —
+///    drawing on a shared recovery budget of 3.
 struct InstallFlow: Equatable {
     enum Stage: String, Equatable {
         case stage1   // floppy boot: unattended Setup phase-1 (file copy)
@@ -187,21 +230,98 @@ struct InstallFlow: Equatable {
 
     /// The stage died mid-run: engine [panic], WebContent process gone, or
     /// capture silence past the watchdog.
-    mutating func died() -> Next {
-        switch stage {
-        case .stage2:
+    ///
+    /// Stage 2's death is AMBIGUOUS, so its caller passes what the stage
+    /// actually DID: only a death that looks like the end of real Setup work
+    /// (`indicatesFinalizeRestart`) advances to stage 3. An early death —
+    /// including nil evidence — re-runs stage 2 on the shared recovery
+    /// budget, which re-seeds the checkpoint and re-runs the keystrokes.
+    mutating func died(stage2Evidence evidence: Stage2DeathEvidence? = nil) -> Next {
+        if stage == .stage2, evidence?.indicatesFinalizeRestart == true {
             // THE expected death: "Windows is shutting down" kills the WASM.
             stage = .stage3
             bootAttempt = 1
             return .bootStage(.stage3, attempt: 1)
-        case .stage1, .stage3:
-            recoveryBoots += 1
-            guard recoveryBoots <= Self.maxRecoveryBoots else {
-                return .failed("\(stage.rawValue) kept dying after \(Self.maxRecoveryBoots) recovery reboots")
-            }
-            bootAttempt = 1
-            return .bootStage(stage, attempt: 1)
         }
+        recoveryBoots += 1
+        guard recoveryBoots <= Self.maxRecoveryBoots else {
+            return .failed("\(stage.rawValue) kept dying after \(Self.maxRecoveryBoots) recovery reboots")
+        }
+        bootAttempt = 1
+        return .bootStage(stage, attempt: 1)
+    }
+}
+
+// MARK: - Stage-2 keystroke loop & stage-3 desktop probe (pure halves)
+
+/// One native-driven keystroke step: evaluate `js` in the page, or idle.
+/// The orchestrator interprets these SWIFT-side (so the timing logic stays
+/// out of the page and the shapes stay unit-testable); the only in-page
+/// timer remains the capture loop.
+enum ScriptStep: Equatable {
+    case press(js: String)
+    case wait(seconds: TimeInterval)
+}
+
+/// Stage 2's wizard-advancing script. The device run killed the old
+/// fixed-delay keystroke table (device Setup paints far slower than the
+/// Chrome runbook timings it encoded), so the pages are now advanced by
+/// REPEATED cycles that are safe wherever Setup happens to be: pre-filled
+/// pages advance on Enter, a disabled Next button no-ops, and only the
+/// License page needs the Alt+A accept chord before its Enter. The loop
+/// exits on EVIDENCE — capture growth proving Setup moved into its
+/// copy/hardware work — never on elapsed time.
+enum SetupScript {
+    /// Idle lead-in after the go release: the C: boot plus Setup's first
+    /// wizard paint.
+    static let leadInSeconds: TimeInterval = 60
+    /// Hard cap on cycles per stage-2 boot (each cycle is breadcrumbed:
+    /// "[pdos-install] script-cycle N").
+    static let maxCycles = 12
+    /// Setup advanced once the count grew this far past the loop-start
+    /// baseline (strictly more): page flips write ~nothing, while the
+    /// copy/hardware phases write thousands of sectors.
+    static let advancedGrowth = 3_000
+
+    /// Enter (advance page) → settle → Alt+A (License accept) → beat →
+    /// Enter (License Next) → settle; the caller then checks growth.
+    static let cycle: [ScriptStep] = [
+        .press(js: InstallJS.pressEnter), .wait(seconds: 8),
+        .press(js: InstallJS.pressAltA), .wait(seconds: 1.5),
+        .press(js: InstallJS.pressEnter), .wait(seconds: 8),
+    ]
+
+    static func hasAdvanced(baseline: Int, latest: Int) -> Bool {
+        latest - baseline > advancedGrowth
+    }
+}
+
+/// Stage 3's "is that plateau really the desktop?" probe. The device run
+/// plateaued on a WAITING wizard page and declared done — so a plateau is
+/// now poked before it is trusted: a real desktop swallows the keys with
+/// zero disk writes (flat → done), a waiting wizard page advances and
+/// writes (grew → keep watching for the next plateau). Breadcrumbed as
+/// "[pdos-install] desktop-probe flat|grew".
+enum DesktopProbe {
+    /// Probes per stage-3 boot; a plateau after the budget is trusted
+    /// (finalize's mouse-fix guard stays the last backstop).
+    static let maxProbes = 3
+    /// Accepted-capture ticks to let the poked page settle before the
+    /// flat-or-grew comparison.
+    static let settleTicks = 3
+
+    /// Same key pattern as a script cycle, compressed: anything a wizard
+    /// page could be waiting on, harmless on a desktop.
+    static let cycle: [ScriptStep] = [
+        .press(js: InstallJS.pressEnter), .wait(seconds: 2),
+        .press(js: InstallJS.pressAltA), .wait(seconds: 1.5),
+        .press(js: InstallJS.pressEnter),
+    ]
+
+    /// Counts are monotonic (the in-page floor guards regressions), so
+    /// "didn't grow" IS "stayed flat".
+    static func isFlat(baseline: Int, latest: Int) -> Bool {
+        latest <= baseline
     }
 }
 
@@ -218,6 +338,14 @@ enum InstallJS {
     /// Alt+A chord (License page's "I accept" accelerator): simulateKeyPress
     /// with two codes presses them together.
     static let pressAltA = "window.ci && window.ci.simulateKeyPress(342, 65)"
+
+    /// Console breadcrumb for NATIVE-driven moves (script cycles, desktop
+    /// probes): same prefix, same stream as the page's own breadcrumbs, so a
+    /// pulled device log reads as ONE interleaved story. These tails parse
+    /// to nil natively (informational only).
+    static func logBreadcrumb(_ tail: String) -> String {
+        "console.log(\(quoted("\(InstallBreadcrumb.prefix) \(tail)")));"
+    }
 
     /// Stops the capture loop (set before the FINAL pull so no fresher persist
     /// replaces `__lastGood` while the finalize is deciding).
@@ -350,6 +478,21 @@ enum InstallJS {
         })();
         """
     }
+}
+
+// MARK: - Overlay header
+
+/// The u32le sector-record count at byte 0 of a serialized sockdrive write
+/// overlay — the same field the in-page capture loop reads. The orchestrator
+/// floors each stage-2/3 boot's capture loop at the count of the checkpoint
+/// it just re-seeded: a stage-2 retry deliberately restores an OLDER
+/// checkpoint, and flooring at the run's global high water would make the
+/// page reject every persist (no accepted captures → no live re-seed, and a
+/// spurious silence death) until Setup re-crossed the stale mark.
+func sockdriveOverlayRecordCount(_ header: Data) -> Int? {
+    guard header.count >= 4 else { return nil }
+    let b = [UInt8](header.prefix(4))
+    return Int(b[0]) | Int(b[1]) << 8 | Int(b[2]) << 16 | Int(b[3]) << 24
 }
 
 // MARK: - Final game shape
