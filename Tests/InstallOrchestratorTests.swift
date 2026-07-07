@@ -48,6 +48,8 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] capture-error persist timeout"))
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] tick-ms 8342"),
                      "the serialize-cost breadcrumb is forensic only, never an event")
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] cadence-switch"),
+                     "stage 1's two-phase flip is forensic only, never an event")
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-fps] raf=60.0 emu=60.0 act=0"))
         XCTAssertEqual(InstallBreadcrumb.parse("log: [pdos-install] capture-regressed 100 200"),
                        .captureRegressed)
@@ -138,22 +140,38 @@ final class InstallOrchestratorTests: XCTestCase {
     // MARK: - Capture transport cadence (device OOM fix)
 
     func testCaptureCadenceTablePerStage() {
-        // stage → (tick, live re-seed, plateau ticks). Stage 1 keeps the
-        // proven 4.5 s + live re-seed (overlays start small; the re-seed is
-        // what lets phase-1's in-page warm reboot resume). Stages 2/3 tick at
-        // 20 s persist-only — serializing AND IndexedDB-copying the ~150 MB
-        // stage-2 overlay every 4.5 s is what Jetsam-killed the device run.
+        // stage → (tick, live re-seed, switch, plateau ticks). Stage 1 is
+        // TWO-PHASE (device run #4: its 120-148 MB tail OOM-cycled on the
+        // same per-tick serialize+re-seed churn that killed run #2's stage
+        // 2): 4.5 s + live re-seed while the overlay is small — the re-seed
+        // is what makes early in-page warm reboots free — then an in-page
+        // switch to the slow persist-only cadence at 200k sectors. Stages
+        // 2/3 tick at 20 s persist-only always (no switch).
         XCTAssertEqual(CaptureCadence.tickSeconds(for: .stage1), 4.5)
         XCTAssertTrue(CaptureCadence.liveReseed(for: .stage1))
-        XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage1), 4)
+        XCTAssertEqual(CaptureCadence.switchCount(for: .stage1), 200_000)
+        XCTAssertEqual(CaptureCadence.stage1SwitchCount, 200_000)
+        XCTAssertEqual(CaptureCadence.slowTickSeconds, 20)
 
         XCTAssertEqual(CaptureCadence.tickSeconds(for: .stage2), 20)
         XCTAssertFalse(CaptureCadence.liveReseed(for: .stage2))
+        XCTAssertNil(CaptureCadence.switchCount(for: .stage2))
         XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage2), 3)
 
         XCTAssertEqual(CaptureCadence.tickSeconds(for: .stage3), 20)
         XCTAssertFalse(CaptureCadence.liveReseed(for: .stage3))
+        XCTAssertNil(CaptureCadence.switchCount(for: .stage3))
         XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage3), 3)
+
+        // A plateau can only FIRE above the 300k minimum, which is past the
+        // 200k switch — so stage 1's plateau-relevant cadence is the slow
+        // one and its plateau rule is 3 equal ticks ≈ 60 s, like stages 2/3
+        // (the old 4-tick/4.5 s rule only covered sub-300k plateaus, which
+        // cannot fire at all).
+        XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage1), 3)
+        XCTAssertGreaterThan(CapturePlateauDetector().minimumCount,
+                             CaptureCadence.stage1SwitchCount,
+                             "every fireable plateau count is post-switch")
     }
 
     func testPlateauFiresOnThirdEqualTickAtTheSlowCadence() {
@@ -244,15 +262,23 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertEqual(flow.recoveryBoots, 0)
     }
 
+    func testSharedRecoveryBudgetIsFive() {
+        // Device run #4: four mid-stage-1 deaths, each of which resumed from
+        // its checkpoint and made real progress (316k→344k→371k→399k
+        // sectors) — failing a 30-60 min run at 3 was too tight. Boundaries
+        // stay budget-free; this is the death budget only.
+        XCTAssertEqual(InstallFlow.maxRecoveryBoots, 5)
+    }
+
     func testStage3DeathsRetryThenExhaustTheRecoveryBudget() {
         var flow = flowAtStage2()
         _ = flow.died(stage2Evidence: finalizeShapedDeath)   // → stage 3 (expected)
         flow.bootSucceeded()
-        XCTAssertEqual(flow.died(), .bootStage(.stage3, attempt: 1))   // recovery 1
-        XCTAssertEqual(flow.died(), .bootStage(.stage3, attempt: 1))   // recovery 2
-        XCTAssertEqual(flow.died(), .bootStage(.stage3, attempt: 1))   // recovery 3
+        for n in 1...InstallFlow.maxRecoveryBoots {
+            XCTAssertEqual(flow.died(), .bootStage(.stage3, attempt: 1), "recovery \(n)")
+        }
         guard case .failed = flow.died() else {
-            return XCTFail("the fourth stage-3 death must fail the install")
+            return XCTFail("the sixth stage-3 death must fail the install")
         }
     }
 
@@ -323,11 +349,12 @@ final class InstallOrchestratorTests: XCTestCase {
 
     func testStage2EarlyDeathsExhaustTheSharedRecoveryBudget() {
         var flow = flowAtStage2()
-        XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath), .bootStage(.stage2, attempt: 1))
-        XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath), .bootStage(.stage2, attempt: 1))
-        XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath), .bootStage(.stage2, attempt: 1))
+        for n in 1...InstallFlow.maxRecoveryBoots {
+            XCTAssertEqual(flow.died(stage2Evidence: earlyCrashDeath),
+                           .bootStage(.stage2, attempt: 1), "recovery \(n)")
+        }
         guard case .failed = flow.died(stage2Evidence: earlyCrashDeath) else {
-            return XCTFail("the fourth early stage-2 crash must fail the install")
+            return XCTFail("the sixth early stage-2 crash must fail the install")
         }
     }
 
@@ -365,14 +392,37 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertTrue(run.regressed(), "two consecutive again — boundary again")
     }
 
-    func testRegressedRunDetectorArmsOnlyForStages2And3() {
-        // Stage 1's live per-tick re-seed keeps IndexedDB current, so its
-        // warm reboots CONTINUE in-page by design — a reload there would
-        // throw away the working continuation (and its 4.5 s cadence makes
-        // transient reboot-race rejections likelier to pair up).
-        XCTAssertFalse(RegressedRunDetector.arms(for: .stage1))
-        XCTAssertTrue(RegressedRunDetector.arms(for: .stage2))
-        XCTAssertTrue(RegressedRunDetector.arms(for: .stage3))
+    func testRegressedRunDetectorAlwaysArmsForStages2And3() {
+        // The run-#3 fix is floor-independent there: a surviving guest
+        // reboot regresses against whatever the boot boundary re-seeded.
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage2, floor: 0, acceptedThisBoot: false))
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage3, floor: 0, acceptedThisBoot: false))
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage2, floor: 800_000, acceptedThisBoot: true))
+    }
+
+    func testStage1RegressedRunArmsOnlyPastTheFileCopyFloor() {
+        // Device run #4: with the two-phase capture loop, IndexedDB is stale
+        // past the cadence switch, so phase-1's completion warm reboot
+        // REGRESSES where it used to plateau — stage 1 must hear it. But
+        // only PAST the file copy (the same 300k bar as the plateau's
+        // minimum): early-boot regressions stay noise.
+        XCTAssertEqual(RegressedRunDetector.stage1CompleteFloor, 300_000)
+        XCTAssertFalse(RegressedRunDetector.arms(for: .stage1, floor: 300_000, acceptedThisBoot: true),
+                       "AT the floor is still early (strictly greater, like the plateau minimum)")
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage1, floor: 300_001, acceptedThisBoot: true))
+        XCTAssertFalse(RegressedRunDetector.arms(for: .stage1, floor: 12_000, acceptedThisBoot: true),
+                       "early-boot noise stays ignored")
+    }
+
+    func testStage1RegressedRunRequiresAnAcceptedCaptureThisBoot() {
+        // The completion signal pulls window.__lastGood — acceptance this
+        // boot is what proves the page holds a fresh post-floor snapshot.
+        // A checkpoint-less recovery boot re-climbing toward a high floor
+        // regresses from its first tick WITHOUT ever accepting: firing there
+        // would pull an empty __lastGood and advance to stage 2 on a
+        // half-copied Windows.
+        XCTAssertFalse(RegressedRunDetector.arms(for: .stage1, floor: 400_000, acceptedThisBoot: false))
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage1, floor: 400_000, acceptedThisBoot: true))
     }
 
     func testInterruptionClassificationPrefersTheRebootBoundary() {
@@ -412,8 +462,10 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertEqual(flow.guestRebooted(), .bootStage(.stage2, attempt: 1))
         XCTAssertEqual(flow.recoveryBoots, 1, "a boundary must not consume a recovery slot")
         flow.bootSucceeded()
-        _ = flow.died(stage2Evidence: earlyCrashDeath)       // recovery 2
-        _ = flow.died(stage2Evidence: earlyCrashDeath)       // recovery 3
+        for n in 2...InstallFlow.maxRecoveryBoots {
+            _ = flow.died(stage2Evidence: earlyCrashDeath)   // recovery n
+            XCTAssertEqual(flow.recoveryBoots, n)
+        }
         guard case .failed = flow.died(stage2Evidence: earlyCrashDeath) else {
             return XCTFail("boundaries must not REFILL the death budget either")
         }
@@ -436,6 +488,57 @@ final class InstallOrchestratorTests: XCTestCase {
                        "the boundary reload gets the full 3-attempt boot budget")
     }
 
+    // MARK: - Stage-1 regressed run = phase-1 complete (device fix, run #4)
+
+    func testRebootBoundaryResponseTable() {
+        // A FIRED regressed run means different things per stage: stages 2/3
+        // reload on the freshest checkpoint (run #3); stage 1's is phase-1's
+        // completion warm reboot regressing against the post-switch stale
+        // IndexedDB (run #4) — answered like the plateau, not like a reload.
+        XCTAssertEqual(RebootBoundaryResponse.response(for: .stage1), .phase1Complete)
+        XCTAssertEqual(RebootBoundaryResponse.response(for: .stage2), .reloadStage)
+        XCTAssertEqual(RebootBoundaryResponse.response(for: .stage3), .reloadStage)
+    }
+
+    func testStage1RegressionCompletionEndsPhase1ExactlyLikeThePlateau() {
+        // Both stage-1 ends converge on the SAME flow transition (stageEnded
+        // → boot stage 2), so stage 2 cannot tell which signal fired — and
+        // neither end draws budget or counts a boundary.
+        var viaPlateau = InstallFlow()
+        _ = viaPlateau.begin(); viaPlateau.bootSucceeded()
+        XCTAssertEqual(viaPlateau.stageEnded(), .bootStage(.stage2, attempt: 1))
+
+        var viaRegression = InstallFlow()
+        _ = viaRegression.begin(); viaRegression.bootSucceeded()
+        XCTAssertEqual(RebootBoundaryResponse.response(for: viaRegression.stage), .phase1Complete)
+        XCTAssertEqual(viaRegression.stageEnded(), .bootStage(.stage2, attempt: 1))
+
+        XCTAssertEqual(viaPlateau, viaRegression, "identical flow state either way")
+        XCTAssertEqual(viaRegression.recoveryBoots, 0)
+        XCTAssertEqual(viaRegression.rebootBoundaries, 0,
+                       "the completion is a stage END, not a counted boundary")
+    }
+
+    func testStage1CompletionSignalsBothSurviveTheDetectorSemantics() {
+        // The plateau path stays for the fresh-store case (e.g. the reboot
+        // lands right after a recovery boot's re-seed): equal ticks above
+        // 300k still fire it at stage 1's slow-cadence rule…
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage1))
+        XCTAssertEqual(d.ingest(344_979), .accepted)   // recovery checkpoint
+        XCTAssertEqual(d.ingest(388_979), .accepted)   // copy finishes (grew → armed)
+        XCTAssertEqual(d.ingest(388_979), .accepted)   // parked pass-2 writes nothing
+        XCTAssertEqual(d.ingest(388_979), .plateau)    // 3 equal slow ticks ≈ 60 s
+        // …while the stale-store case regresses instead and fires the
+        // detector run (the floor keeps rejecting the remounted counts).
+        var run = RegressedRunDetector()
+        XCTAssertEqual(d.ingest(201_144), .rejected)   // remount re-read stale IndexedDB
+        XCTAssertFalse(run.regressed())
+        XCTAssertEqual(d.ingest(201_144), .rejected)
+        XCTAssertTrue(run.regressed(), "two consecutive = the completion warm reboot")
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage1, floor: 388_979,
+                                                acceptedThisBoot: true))
+    }
+
     // MARK: - Stage deadlines (device fix: stage 3 runs ScanDisk + a PnP re-pass)
 
     @MainActor
@@ -452,23 +555,69 @@ final class InstallOrchestratorTests: XCTestCase {
 
     // MARK: - Injected JS builders
 
-    func testCaptureLoopJSStage1CarriesTheLoadBearingPieces() {
-        let js = InstallJS.captureLoop(
-            targetBase: "pocketdos://app/lib/ABC/target-drive/drive", floor: 123_456,
+    /// Builds stage 1's capture loop exactly as armCaptureLoop does.
+    private func stage1CaptureLoopJS(floor: Int) -> String {
+        InstallJS.captureLoop(
+            targetBase: "pocketdos://app/lib/ABC/target-drive/drive", floor: floor,
             tickSeconds: CaptureCadence.tickSeconds(for: .stage1),
-            liveReseed: CaptureCadence.liveReseed(for: .stage1))
+            liveReseed: CaptureCadence.liveReseed(for: .stage1),
+            reseedSwitchCount: CaptureCadence.switchCount(for: .stage1),
+            switchedTickSeconds: CaptureCadence.slowTickSeconds)
+    }
+
+    func testCaptureLoopJSStage1CarriesTheLoadBearingPieces() {
+        let js = stage1CaptureLoopJS(floor: 123_456)
         XCTAssertTrue(js.contains("\"pocketdos://app/lib/ABC/target-drive/drive\""),
                       "the target base must be matched EXACTLY (two drives are mounted)")
         XCTAssertTrue(js.contains("var last = 123456;"),
                       "the monotonic floor must survive page reloads via Swift")
         XCTAssertTrue(js.contains("ci.persist(true)"))
-        XCTAssertTrue(js.contains("pdosReseed"),
-                      "stage 1's LIVE re-seed is what makes its warm reboots survive")
+        XCTAssertTrue(js.contains("if (live) { await window.pdosReseed"),
+                      "stage 1's EARLY live re-seed is what makes early warm reboots free — "
+                      + "and it must be gated so the switched tail stops paying for it")
         XCTAssertTrue(js.contains("[pdos-install] captured "))
         XCTAssertTrue(js.contains("[pdos-install] tick-ms "),
                       "every persist logs its serialize cost (device OOM forensics)")
-        XCTAssertTrue(js.contains("setInterval(tick, 4500)"),
-                      "stage 1 keeps the proven 4.5s capture cadence")
+    }
+
+    func testCaptureLoopJSStage1IsTwoPhaseWithAnInPlaceSwitch() throws {
+        // Device run #4: stage 1's tail OOM-cycled on per-tick serialize +
+        // live re-seed at 120-148 MB. Below the 200k switch the loop keeps
+        // the proven fast cadence; past it it must flip ITSELF (no Swift
+        // round-trip) to the slow persist-only tick and say so once.
+        let js = stage1CaptureLoopJS(floor: 123_456)
+        XCTAssertTrue(js.contains("var live = true;"),
+                      "floored below the switch → starts in the fast live-re-seed phase")
+        XCTAssertTrue(js.contains("setInterval(tick, live ? 4500 : 20000)"),
+                      "initial arm picks the phase the floor baked")
+        XCTAssertTrue(js.contains("if (live && count >= 200000) { live = false;"),
+                      "the switch fires in-place on the accepted count crossing 200k")
+        XCTAssertTrue(js.contains("clearInterval(window.__pdosCapTimer); "
+                                  + "window.__pdosCapTimer = setInterval(tick, 20000);"),
+                      "the flip re-arms the SAME loop at the slow tick")
+        XCTAssertTrue(js.contains("[pdos-install] cadence-switch"),
+                      "one forensic breadcrumb marks the flip")
+        // The crossing capture is re-seeded BEFORE the flip (the re-seed
+        // line precedes the switch line), so IndexedDB's stale tail state
+        // is the switch point, not one tick before it.
+        let reseedAt = try XCTUnwrap(js.range(of: "await window.pdosReseed"))
+        let switchAt = try XCTUnwrap(js.range(of: "if (live && count >= 200000)"))
+        XCTAssertTrue(reseedAt.lowerBound < switchAt.lowerBound)
+    }
+
+    func testCaptureLoopJSStage1StartsSlowWhenFlooredPastTheSwitch() {
+        // A recovery boot re-seeded from a post-switch checkpoint (or the
+        // completion re-signal path) must not re-enter the fast phase: its
+        // overlay is already Jetsam-sized. The baked `live` flag starts
+        // false and the loop arms straight at the slow persist-only tick.
+        let js = stage1CaptureLoopJS(floor: 344_979)
+        XCTAssertTrue(js.contains("var live = false;"))
+        XCTAssertTrue(js.contains("var last = 344979;"))
+        XCTAssertTrue(js.contains("setInterval(tick, live ? 4500 : 20000)"))
+        // Exactly AT the switch count also starts slow (strictly-below is
+        // what bakes fast).
+        XCTAssertTrue(stage1CaptureLoopJS(floor: 200_000).contains("var live = false;"))
+        XCTAssertTrue(stage1CaptureLoopJS(floor: 199_999).contains("var live = true;"))
     }
 
     func testCaptureLoopJSStages2And3ArePersistOnlyAtTheSlowTick() {
@@ -482,7 +631,9 @@ final class InstallOrchestratorTests: XCTestCase {
             let js = InstallJS.captureLoop(
                 targetBase: "pocketdos://app/lib/ABC/target-drive/drive", floor: 388_915,
                 tickSeconds: CaptureCadence.tickSeconds(for: stage),
-                liveReseed: CaptureCadence.liveReseed(for: stage))
+                liveReseed: CaptureCadence.liveReseed(for: stage),
+                reseedSwitchCount: CaptureCadence.switchCount(for: stage),
+                switchedTickSeconds: CaptureCadence.slowTickSeconds)
             XCTAssertFalse(js.contains("pdosReseed"),
                            "\(stage): NO per-tick re-seed — that copy is what OOM'd the phone")
             XCTAssertTrue(js.contains("window.__lastGood = bytes"),
@@ -492,6 +643,9 @@ final class InstallOrchestratorTests: XCTestCase {
             XCTAssertTrue(js.contains("[pdos-install] captured "))
             XCTAssertTrue(js.contains("[pdos-install] tick-ms "))
             XCTAssertTrue(js.contains("setInterval(tick, 20000)"), "\(stage): 20s tick")
+            XCTAssertFalse(js.contains("cadence-switch"),
+                           "\(stage): single-phase — the two-phase machinery is stage 1's")
+            XCTAssertFalse(js.contains("4500"), "\(stage): no fast tick anywhere")
         }
     }
 
@@ -523,6 +677,8 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] desktop-probe flat"))
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] desktop-probe grew"))
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] reboot-boundary"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] stage1-complete regressed-run"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] stage1-complete pull-failed"))
     }
 
     // MARK: - Stage-2 keystroke loop (device fix 2)

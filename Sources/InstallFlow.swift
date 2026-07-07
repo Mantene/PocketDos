@@ -20,11 +20,18 @@ import Foundation
 // checkpoint, unbudgeted (RegressedRunDetector — the device-run-#3 fix),
 // with the install state carried between stages as the target sockdrive's
 // write-overlay blob, captured in-page via `ci.persist(true)` on a per-stage
-// cadence (CaptureCadence). Stage 1 re-seeds every accepted capture LIVE into
-// IndexedDB (that re-seed is what lets its warm reboots and page reloads
-// continue instead of restarting); stages 2/3 persist-only every 20 s — the
-// second device run OOM'd serializing AND copying a ~150 MB overlay into
-// IndexedDB every 4.5 s (≈300+ MB of transient allocation per tick).
+// cadence (CaptureCadence). Stage 1's capture loop is TWO-PHASE (the
+// device-run-#4 fix): while the overlay is small it re-seeds every accepted
+// capture LIVE into IndexedDB (that re-seed is what makes early warm reboots
+// and page reloads free), and past 200k sectors it switches in-place to the
+// slow persist-only cadence stages 2/3 always run — per-tick serialize AND
+// IndexedDB copy of a 120-150 MB overlay is ≈300+ MB of transient allocation
+// per tick, the exact churn that Jetsam-killed run #2's stage 2 and run #4's
+// stage-1 tail. Past the switch IndexedDB is deliberately stale, so stage
+// 1's ends change too: its phase-1 completion warm reboot now surfaces as a
+// REGRESSED run (the remount re-reads the stale store) and is treated like
+// the plateau, and its mid-stage death recoveries boot parked and re-seed
+// the pulled checkpoint exactly like stages 2/3 boot boundaries.
 
 // MARK: - Breadcrumb parsing
 
@@ -168,10 +175,33 @@ struct RegressedRunDetector: Equatable {
     /// Consecutive rejected persists that mean "the guest rebooted in-page".
     static let bootBoundaryRun = 2
 
-    /// Stage 1 never arms the detector: its live per-tick re-seed keeps
-    /// IndexedDB current, so its warm reboots CONTINUE in-page by design —
-    /// and its 4.5 s cadence makes transient reboot-race rejections likelier.
-    static func arms(for stage: InstallFlow.Stage) -> Bool { stage != .stage1 }
+    /// Stage 1's regressed run only means something LATE: past the cadence
+    /// switch IndexedDB is deliberately stale, so phase-1's completion warm
+    /// reboot (the one-shot park) remounts BELOW the floor and regresses —
+    /// the file copy is well past this mark by then (the same bar as the
+    /// plateau's minimumCount). Below it, regressions are early-boot noise.
+    static let stage1CompleteFloor = 300_000
+
+    /// Whether a regressed run may fire for `stage`.
+    ///
+    /// Stages 2/3 always arm (the device-run-#3 fix: a surviving guest
+    /// reboot remounts stale boot-boundary IndexedDB and the floor rejects
+    /// every persist until the stage reloads).
+    ///
+    /// Stage 1 arms only for its phase-1 COMPLETION signal (device run #4:
+    /// with the two-phase capture loop, IndexedDB goes stale past the
+    /// switch, so the completion warm reboot regresses instead of
+    /// plateauing): the run's monotonic floor must be PAST the file copy
+    /// (`floor > stage1CompleteFloor`, strictly) AND this boot must have
+    /// accepted at least one capture — acceptance is what proves the page
+    /// still holds a fresh post-floor `window.__lastGood` to pull. A fresh
+    /// recovery boot re-climbing toward a high floor regresses for a while
+    /// without ever having accepted; firing there would pull an EMPTY
+    /// `__lastGood` and advance to stage 2 on a half-copied Windows.
+    static func arms(for stage: InstallFlow.Stage, floor: Int, acceptedThisBoot: Bool) -> Bool {
+        if stage != .stage1 { return true }
+        return floor > Self.stage1CompleteFloor && acceptedThisBoot
+    }
 
     private(set) var consecutiveRegressed = 0
 
@@ -203,6 +233,24 @@ enum StageInterruption: Equatable {
         if rebootBoundary { return .guestReboot }
         if death { return .death }
         return nil
+    }
+}
+
+/// What a FIRED reboot boundary means, per stage. Stages 2/3 reload the same
+/// stage on the freshest pulled checkpoint (device run #3). Stage 1's is the
+/// phase-1 COMPLETION signal (device run #4): with the two-phase capture
+/// loop, IndexedDB is stale past the cadence switch, so Setup's end-of-copy
+/// warm reboot into the one-shot park remounts below the floor and REGRESSES
+/// where it used to plateau — the orchestrator answers it exactly like the
+/// plateau (snapshot-pin + pull `__lastGood` → stage.bin → stage 2). The
+/// plateau path itself stays: it still fires when the store happened to be
+/// fresh at the reboot (e.g. right after a recovery boot's re-seed).
+enum RebootBoundaryResponse: Equatable {
+    case phase1Complete   // stage 1: pull __lastGood → stage.bin → stage 2
+    case reloadStage      // stages 2/3: reload on the freshest checkpoint
+
+    static func response(for stage: InstallFlow.Stage) -> RebootBoundaryResponse {
+        stage == .stage1 ? .phase1Complete : .reloadStage
     }
 }
 
@@ -251,7 +299,10 @@ struct Stage2DeathEvidence: Equatable {
 ///  - any other mid-stage death (stage 1, stage 3, an EARLY stage-2 crash,
 ///    or capture silence >5 min) re-boots that stage — for stage 2 that
 ///    means re-seeding the checkpoint and RE-RUNNING the keystroke script —
-///    drawing on a shared recovery budget of 3.
+///    drawing on a shared recovery budget of 5 (device run #4 burned 4
+///    productive deaths mid-stage-1, each of which demonstrably resumed
+///    from its checkpoint and progressed; failing a 30-60 min run at 3
+///    was too tight).
 struct InstallFlow: Equatable {
     enum Stage: String, Equatable {
         case stage1   // floppy boot: unattended Setup phase-1 (file copy)
@@ -266,7 +317,7 @@ struct InstallFlow: Equatable {
     }
 
     static let maxBootAttempts = 3
-    static let maxRecoveryBoots = 3
+    static let maxRecoveryBoots = 5
 
     private(set) var stage: Stage = .stage1
     private(set) var bootAttempt = 1
@@ -354,28 +405,45 @@ struct InstallFlow: Equatable {
 /// the TRANSPORT fatal: every 4.5 s tick ran `ci.persist(true)` AND a live
 /// IndexedDB re-seed, so with stage 2's ~150 MB overlay each tick transiently
 /// allocated 300+ MB on top of the overlay map + wasm heap — iOS Jetsam
-/// killed WebContent ~50-60 s after ci-ready, every boot. Only the transport
-/// gets cheaper here; growth detection, plateau, and lastGood recovery
-/// semantics are unchanged.
-///  - Stage 1 keeps 4.5 s + live re-seed: its overlays start small, and the
-///    re-seed is what lets phase-1's in-page warm reboot continue.
+/// killed WebContent ~50-60 s after ci-ready, every boot. Run #4 showed
+/// stage 1's TAIL hits the same wall (OOM-cycling at 120-148 MB, tick-ms
+/// 1.4-2.0 s of serialize alone — earlier runs were winning Jetsam
+/// roulette). Only the transport gets cheaper here; growth detection,
+/// plateau, and lastGood recovery semantics are unchanged.
+///  - Stage 1 is TWO-PHASE, switched in-place by the injected loop itself:
+///    it starts at 4.5 s + live re-seed (early overlays are small, and the
+///    re-seed is what makes early in-page warm reboots free), then past
+///    `stage1SwitchCount` accepted sectors it flips to the slow persist-only
+///    cadence — same transport as stages 2/3 — breadcrumbing one
+///    "[pdos-install] cadence-switch".
 ///  - Stages 2/3 tick every 20 s with NO per-tick re-seed (persist only,
 ///    `__lastGood` held in page memory): live re-seed only serves in-page
 ///    guest warm reboots, stage-2/3's only reboot (the finalize restart)
 ///    kills the process anyway, and every boot boundary explicitly re-seeds
 ///    the pulled checkpoint (reseedAndGo).
-///  - Plateau stays ~a minute of settled writes in wall-clock terms:
-///    4 equal ticks at 4.5 s for stage 1 (the proven runbook rule), 3 equal
-///    ticks ≈ 60 s at the 20 s cadence.
+///  - Plateau = 3 equal ticks ≈ 60 s at the 20 s cadence, for stage 1 too:
+///    a plateau only ever FIRES above the 300k minimum, which is past the
+///    200k switch — so the plateau-relevant cadence is always the slow one
+///    (sub-switch plateaus don't occur, and wouldn't fire if they did).
 enum CaptureCadence {
+    /// Stage 1's in-place switch point (accepted sectors): past this the
+    /// overlay is ~76 MB+ and per-tick re-seed churn becomes Jetsam bait.
+    static let stage1SwitchCount = 200_000
+    /// The slow persist-only tick (stages 2/3 always; stage 1 post-switch).
+    static let slowTickSeconds: TimeInterval = 20
+
     static func tickSeconds(for stage: InstallFlow.Stage) -> TimeInterval {
-        stage == .stage1 ? 4.5 : 20
+        stage == .stage1 ? 4.5 : slowTickSeconds
     }
     static func liveReseed(for stage: InstallFlow.Stage) -> Bool {
         stage == .stage1
     }
+    /// The two-phase switch threshold, nil = single-phase (stages 2/3).
+    static func switchCount(for stage: InstallFlow.Stage) -> Int? {
+        stage == .stage1 ? stage1SwitchCount : nil
+    }
     static func plateauTicks(for stage: InstallFlow.Stage) -> Int {
-        stage == .stage1 ? 4 : 3
+        3
     }
 }
 
@@ -516,28 +584,64 @@ enum InstallJS {
     /// logs show what each tick spent (the OOM forensic that was missing).
     ///
     /// `liveReseed` additionally copies each accepted blob into IndexedDB
-    /// (`pdosReseed`). Stage 1 wants that: the re-seed is what lets phase-1's
-    /// in-page warm reboot resume, and stage-1 overlays start small. Stages
-    /// 2/3 run persist-only (CaptureCadence): re-seeding a ~150 MB overlay on
-    /// every 4.5 s tick is what Jetsam-killed WebContent on device, their only
-    /// reboot (the finalize restart) kills the process anyway, and every boot
-    /// boundary explicitly re-seeds the pulled checkpoint (reseedAndGo).
+    /// (`pdosReseed`). Stage 1 wants that EARLY: the re-seed is what lets
+    /// phase-1's in-page warm reboots resume, and stage-1 overlays start
+    /// small. It must not keep it LATE (device run #4): past
+    /// `reseedSwitchCount` accepted sectors the loop switches itself —
+    /// clearInterval + setInterval, no Swift round-trip — to
+    /// `switchedTickSeconds` persist-only ticks, logging one
+    /// `[pdos-install] cadence-switch`, because serialize + IndexedDB copy
+    /// of a 120-150 MB overlay every 4.5 s is ≈300+ MB of transient
+    /// allocation per tick and Jetsam kills WebContent for it. The `live`
+    /// flag is BAKED from the floor, so a recovery boot floored past the
+    /// switch starts slow/persist-only outright. Stages 2/3 run persist-only
+    /// at the slow tick always (CaptureCadence, `reseedSwitchCount` nil):
+    /// their only reboot (the finalize restart) kills the process anyway,
+    /// and every boot boundary explicitly re-seeds the pulled checkpoint
+    /// (reseedAndGo).
     ///
     /// `floor` seeds the monotonic guard ACROSS page reloads: the page-local
     /// floor dies with the page, so a partial persist on the first tick of a
     /// recovery boot could otherwise be accepted and re-seeded — regressing
-    /// IndexedDB. The orchestrator passes the highest count it has ever seen.
+    /// IndexedDB. The orchestrator passes the count of the checkpoint this
+    /// boot actually resumes from (captureFloor).
     ///
     /// The pull channel (`pdosCapPullBegin/Chunk/End`) mirrors the
     /// pdosPersistBegin/Chunk/End transport shape: begin pins the CURRENT
     /// `__lastGood` reference (persist passes replace, never mutate, so the
     /// pinned blob stays coherent while ticks continue), chunks stream base64.
     static func captureLoop(targetBase: String, floor: Int,
-                            tickSeconds: TimeInterval, liveReseed: Bool) -> String {
+                            tickSeconds: TimeInterval, liveReseed: Bool,
+                            reseedSwitchCount: Int? = nil,
+                            switchedTickSeconds: TimeInterval = CaptureCadence.slowTickSeconds) -> String {
         let tickMs = Int((tickSeconds * 1000).rounded())
-        let reseedLine = liveReseed
-            ? "await window.pdosReseed(TARGET, bytes);"
-            : "/* no per-tick re-seed (device OOM fix): boot boundaries re-seed the pulled checkpoint */"
+        let slowMs = Int((switchedTickSeconds * 1000).rounded())
+        let phaseLine: String
+        let reseedLine: String
+        let switchLine: String
+        let armExpr: String
+        if liveReseed, let cut = reseedSwitchCount {
+            // Two-phase (stage 1): fast + live re-seed while small, then an
+            // in-place flip to slow persist-only. `live` bakes from the floor
+            // so a checkpoint-floored recovery boot starts already switched.
+            phaseLine = "var live = \(floor < cut);"
+            reseedLine = "if (live) { await window.pdosReseed(TARGET, bytes); }"
+            switchLine = "if (live && count >= \(cut)) { live = false; "
+                + "clearInterval(window.__pdosCapTimer); "
+                + "window.__pdosCapTimer = setInterval(tick, \(slowMs)); "
+                + "console.log(\"[pdos-install] cadence-switch\"); }"
+            armExpr = "live ? \(tickMs) : \(slowMs)"
+        } else if liveReseed {
+            phaseLine = ""
+            reseedLine = "await window.pdosReseed(TARGET, bytes);"
+            switchLine = ""
+            armExpr = "\(tickMs)"
+        } else {
+            phaseLine = ""
+            reseedLine = "/* no per-tick re-seed (device OOM fix): boot boundaries re-seed the pulled checkpoint */"
+            switchLine = ""
+            armExpr = "\(tickMs)"
+        }
         return """
         (function () {
           if (window.__pdosCapTimer) { clearInterval(window.__pdosCapTimer); window.__pdosCapTimer = null; }
@@ -545,6 +649,7 @@ enum InstallJS {
           var TARGET = \(quoted(targetBase));
           var last = \(max(0, floor));
           var busy = false;
+          \(phaseLine)
           function b64(u8) {
             var s = "", CHUNK = 0x8000;
             for (var i = 0; i < u8.length; i += CHUNK) {
@@ -593,6 +698,7 @@ enum InstallJS {
                 window.__lastGood = bytes;
                 \(reseedLine)
                 console.log("[pdos-install] captured " + count + " " + bytes.length);
+                \(switchLine)
               } else {
                 console.log("[pdos-install] capture-regressed " + count + " " + last);
               }
@@ -600,16 +706,18 @@ enum InstallJS {
               console.log("[pdos-install] capture-error " + (e && e.message ? e.message : e));
             } finally { busy = false; }
           }
-          window.__pdosCapTimer = setInterval(tick, \(tickMs));
+          window.__pdosCapTimer = setInterval(tick, \(armExpr));
         })();
         """
     }
 
-    /// Stage 2/3 launch: on "[pdos-install] waiting for go", fetch the pulled
-    /// stage checkpoint and re-seed it into IndexedDB BEFORE the sockdrive
-    /// mounts, then release the parked boot. A failed fetch does NOT wedge the
-    /// stage: the capture loop re-seeded IndexedDB live on every accepted
-    /// capture, so the store already holds the last good state — log and go.
+    /// Parked-boot launch (stages 2/3 always; stage-1 recovery boots once a
+    /// pulled checkpoint exists): on "[pdos-install] waiting for go", fetch
+    /// the pulled stage checkpoint and re-seed it into IndexedDB BEFORE the
+    /// sockdrive mounts, then release the parked boot. A failed fetch does
+    /// NOT wedge the stage: IndexedDB still holds the last state re-seeded
+    /// into it (a prior boundary's checkpoint, or stage 1's live re-seeds up
+    /// to the cadence switch) — log and go, and let the guest re-climb.
     static func reseedAndGo(stageBinURL: String, targetBase: String) -> String {
         """
         (async function () {

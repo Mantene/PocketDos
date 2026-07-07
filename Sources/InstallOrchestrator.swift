@@ -35,6 +35,19 @@ struct InstallError: Error {
 /// wait, no recovery-slot draw, no crash-prone stale re-climbs dirtying
 /// the FAT.
 ///
+/// Device run #4 fix: stage 1's TAIL was OOM-cycling on the same churn that
+/// killed run #2's stage 2 (per-tick serialize + live IndexedDB re-seed of a
+/// 120-148 MB overlay every 4.5 s). Its capture loop is now two-phase — the
+/// injected JS itself flips to the slow persist-only cadence past 200k
+/// accepted sectors ("cadence-switch") — which makes IndexedDB deliberately
+/// stale in the tail, with two consequences wired here: (a) phase-1's
+/// completion warm reboot now usually surfaces as a REGRESSED run instead of
+/// a plateau, and stage 1 answers it exactly like the plateau (pull
+/// `__lastGood` → stage.bin → stage 2); (b) a stage-1 mid-tail death can no
+/// longer resume off IndexedDB alone, so stage-1 RECOVERY boots park behind
+/// `pdosInstallGo` and re-seed the freshest pulled checkpoint first — the
+/// same boot-boundary transport stages 2/3 always use.
+///
 /// It observes the install page through the EXISTING console bridge — via the
 /// additive `EmulatorController.onConsoleLine` hook — and through
 /// `EmulatorController.loadError` (the Bridge reports engine panics and
@@ -78,8 +91,9 @@ final class InstallOrchestrator: ObservableObject {
     // MARK: - Tunables (runbook timings, generous)
 
     // In-page persist cadence + re-seed policy are PER STAGE: CaptureCadence
-    // (InstallFlow.swift) — stage 1 at the proven 4.5 s with live re-seed,
-    // stages 2/3 at 20 s persist-only (the device OOM fix).
+    // (InstallFlow.swift) — stage 1 two-phase (4.5 s + live re-seed while the
+    // overlay is small, in-page switch to 20 s persist-only past 200k
+    // sectors — device run #4), stages 2/3 at 20 s persist-only always.
     static let bootTimeout: TimeInterval = 90    // load → ci-ready / waiting-for-go
     static let captureSilenceLimit: TimeInterval = 300   // persist silence = death
     /// Panic/crash events arriving this soon after a load() are the OLD page's
@@ -150,6 +164,17 @@ final class InstallOrchestrator: ObservableObject {
     /// capture loop's monotonic floor so a reloaded page can't re-seed a
     /// regressed (partial) persist over IndexedDB.
     private var captureHighWater = 0
+    /// Highest count the page provably LIVE-re-seeded into IndexedDB (stage
+    /// 1's fast phase only — the page logs `captured` AFTER awaiting the
+    /// re-seed, so every accepted fast-phase capture is in the store). Past
+    /// the cadence switch the high water runs AHEAD of IndexedDB, and a
+    /// checkpoint-less stage-1 recovery flooring at the high water would
+    /// reject every persist of the resumed copy (device run #4's fix): the
+    /// floor must sit where the store actually is.
+    private var lastLiveReseedCount = 0
+    /// Swift mirror of the injected loop's `live` flag (stage 1's fast
+    /// phase): true while accepted captures are still being re-seeded live.
+    private var liveReseedActive = false
 
     deinit {
         masterTask?.cancel()
@@ -169,6 +194,8 @@ final class InstallOrchestrator: ObservableObject {
         gameId = id
         gameFolder = store.gamesURL.appendingPathComponent(id, isDirectory: true)
         captureHighWater = 0
+        lastLiveReseedCount = 0
+        liveReseedActive = false
         latestCaptureCount = 0
         eventQueue.removeAll()
         startedAt = Date()
@@ -314,6 +341,15 @@ final class InstallOrchestrator: ObservableObject {
             deathSeen = true
         case .captured(let count, _):
             regressedRun.accepted()
+            if liveReseedActive {
+                // Mirror of the page's fast phase: this capture was awaited
+                // into IndexedDB before it was logged. The crossing capture
+                // is re-seeded too, THEN the loop switches.
+                lastLiveReseedCount = max(lastLiveReseedCount, count)
+                if let cut = CaptureCadence.switchCount(for: currentStage), count >= cut {
+                    liveReseedActive = false
+                }
+            }
             if stageDetector.ingest(count) == .plateau { plateauSeen = true }
             latestCaptureCount = count
             if case .stage1FileCopy = state { state = .stage1FileCopy(captureCount: count) }
@@ -321,9 +357,15 @@ final class InstallOrchestrator: ObservableObject {
             // Device run #3: in stages 2/3 a surviving guest reboot remounts
             // stale boot-boundary IndexedDB, so the in-page floor rejects
             // every persist while the guest re-runs finished work. Two
-            // consecutive rejections ARE that reboot; stage 1 (live re-seed,
-            // in-page continuation) never arms this.
-            guard RegressedRunDetector.arms(for: currentStage) else { break }
+            // consecutive rejections ARE that reboot. Device run #4: stage 1
+            // arms too once the floor is past the file copy AND this boot
+            // has accepted a capture (a fresh post-floor __lastGood provably
+            // exists) — there the fired run is phase-1's completion warm
+            // reboot regressing against the post-switch stale store.
+            guard RegressedRunDetector.arms(for: currentStage,
+                                            floor: captureHighWater,
+                                            acceptedThisBoot: stageDetector.firstAccepted != nil)
+            else { break }
             if regressedRun.regressed() { rebootBoundarySeen = true }
         case .cancelled:
             break   // the loops' Task.checkCancellation() throws right after
@@ -396,14 +438,19 @@ final class InstallOrchestrator: ObservableObject {
     private var stageBinURLString: String { abs("lib/\(gameId ?? "")/stage.bin") }
     private func stageBinFileURL(_ folder: URL) -> URL { folder.appendingPathComponent("stage.bin") }
 
-    private func stageURL(_ stage: InstallFlow.Stage) -> URL {
+    /// `parked` adds &instwait=1 (the page parks the boot behind
+    /// `pdosInstallGo` so a checkpoint can be re-seeded BEFORE the sockdrive
+    /// mounts). Stages 2/3 always park; stage 1 parks on recovery boots only
+    /// (the page's instwait handling is independent of instboot/instfloppy).
+    private func stageURL(_ stage: InstallFlow.Stage, parked: Bool) -> URL {
         var q = "?insttarget=" + enc(targetBase) + "&instsrc=" + enc(srcBase)
         switch stage {
         case .stage1:
             q += "&instfloppy=" + enc(floppyURLString)
         case .stage2, .stage3:
-            q += "&instboot=c&instwait=1"
+            q += "&instboot=c"
         }
+        if parked { q += "&instwait=1" }
         return URL(string: BundleSchemeHandler.startURL.absoluteString + q) ?? BundleSchemeHandler.startURL
     }
 
@@ -440,7 +487,7 @@ final class InstallOrchestrator: ObservableObject {
                     restartStageClock = false
                 }
                 publishStageEntry(stage)
-                let booted = try await bootStage(stage, shared: shared)
+                let booted = try await bootStage(stage, shared: shared, folder: folder)
                 guard booted else {
                     next = flow.bootFailed()   // boot retries keep the stage clock
                     continue
@@ -481,20 +528,51 @@ final class InstallOrchestrator: ObservableObject {
                     next = flow.stageEnded()
                     restartStageClock = true
                 case .guestRebooted:
-                    // Device run #3 fix: the guest rebooted IN-PAGE. Stages
-                    // 2/3 hold only the boot-boundary re-seed in IndexedDB,
-                    // so the remount handed the guest STALE state — left
-                    // alone it re-runs finished work for the floor to reject
-                    // (5-minute silence stall) and panics mid-climb often
-                    // enough to dirty the FAT. The page is still ALIVE and
-                    // __lastGood holds the newest pre-reboot snapshot: pull
-                    // it as the stage checkpoint NOW (a failed pull falls
-                    // back to the last pulled checkpoint, exactly like the
-                    // death path) and reload the stage — no watchdog wait,
-                    // no recovery-budget draw, stage clock keeps running.
-                    emitBreadcrumb("reboot-boundary", shared: shared)
-                    try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
-                    next = flow.guestRebooted()
+                    switch RebootBoundaryResponse.response(for: stage) {
+                    case .phase1Complete:
+                        // Device run #4: with stage 1's two-phase loop,
+                        // IndexedDB is stale past the cadence switch, so
+                        // Setup's end-of-copy warm reboot into the one-shot
+                        // park remounts BELOW the floor and REGRESSES where
+                        // it used to plateau. The arming rule guaranteed
+                        // this boot accepted a post-300k capture, so the
+                        // still-alive page holds a fresh __lastGood: treat
+                        // the fired run exactly like the plateau — pin +
+                        // pull it as the stage checkpoint and move to
+                        // stage 2. The pull moves ~150 MB over the bridge
+                        // on a possibly strained page (run #3's residual),
+                        // so unlike the plateau a failure here falls back
+                        // to a budgeted stage-1 recovery — reboot on the
+                        // last checkpoint, re-climb, re-signal — instead of
+                        // failing the whole run.
+                        emitBreadcrumb("stage1-complete regressed-run", shared: shared)
+                        do {
+                            try await pullCapture(shared: shared, to: stageBinFileURL(folder))
+                            next = flow.stageEnded()
+                        } catch let error where error is CancellationError {
+                            throw error
+                        } catch {
+                            emitBreadcrumb("stage1-complete pull-failed", shared: shared)
+                            next = flow.died()
+                        }
+                        restartStageClock = true
+                    case .reloadStage:
+                        // Device run #3 fix: the guest rebooted IN-PAGE.
+                        // Stages 2/3 hold only the boot-boundary re-seed in
+                        // IndexedDB, so the remount handed the guest STALE
+                        // state — left alone it re-runs finished work for
+                        // the floor to reject (5-minute silence stall) and
+                        // panics mid-climb often enough to dirty the FAT.
+                        // The page is still ALIVE and __lastGood holds the
+                        // newest pre-reboot snapshot: pull it as the stage
+                        // checkpoint NOW (a failed pull falls back to the
+                        // last pulled checkpoint, exactly like the death
+                        // path) and reload the stage — no watchdog wait, no
+                        // recovery-budget draw, stage clock keeps running.
+                        emitBreadcrumb("reboot-boundary", shared: shared)
+                        try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
+                        next = flow.guestRebooted()
+                    }
                 case .died:
                     // Best-effort checkpoint refresh: after a [panic] the page
                     // usually still answers (only the WASM died), and its
@@ -518,27 +596,32 @@ final class InstallOrchestrator: ObservableObject {
         }
     }
 
-    /// Loads the stage's page and sees it through to ci-ready. Stage 2/3 park
-    /// behind `pdosInstallGo` (instwait=1): wait for the park breadcrumb,
-    /// re-seed the checkpoint, release the boot, then wait for ci-ready.
-    /// Returns false on a failed boot (timeout or death) — the flow's retry
-    /// budget decides what happens next.
-    private func bootStage(_ stage: InstallFlow.Stage, shared: SharedEmulator) async throws -> Bool {
+    /// Loads the stage's page and sees it through to ci-ready. Parked boots
+    /// (stages 2/3 always; stage-1 RECOVERY boots, i.e. once a pulled
+    /// checkpoint exists — device run #4: past the cadence switch IndexedDB
+    /// is deliberately stale, so a resumed stage 1 must re-seed the pulled
+    /// checkpoint before the sockdrive mounts, the same boot-boundary
+    /// transport stages 2/3 use; the first boot has nothing to re-seed and
+    /// boots plain off live-re-seeded IndexedDB): wait for the park
+    /// breadcrumb, re-seed the checkpoint, release the boot, then wait for
+    /// ci-ready. Returns false on a failed boot (timeout or death) — the
+    /// flow's retry budget decides what happens next.
+    private func bootStage(_ stage: InstallFlow.Stage, shared: SharedEmulator, folder: URL) async throws -> Bool {
         resetPhaseFlags()
         shared.controller.loadError = nil
+        let parked = stage != .stage1
+            || FileManager.default.fileExists(atPath: stageBinFileURL(folder).path)
         lastLoadAt = Date()
-        shared.webView.load(URLRequest(url: stageURL(stage)))
-        switch stage {
-        case .stage1:
-            return try await waitBoot { self.ciReadySeen }
-        case .stage2, .stage3:
-            guard try await waitBoot({ self.waitingForGoSeen }) else { return false }
-            goAt = Date()
-            shared.webView.evaluateJavaScript(
-                InstallJS.reseedAndGo(stageBinURL: stageBinURLString, targetBase: targetBase),
-                completionHandler: nil)
+        shared.webView.load(URLRequest(url: stageURL(stage, parked: parked)))
+        guard parked else {
             return try await waitBoot { self.ciReadySeen }
         }
+        guard try await waitBoot({ self.waitingForGoSeen }) else { return false }
+        goAt = Date()
+        shared.webView.evaluateJavaScript(
+            InstallJS.reseedAndGo(stageBinURL: stageBinURLString, targetBase: targetBase),
+            completionHandler: nil)
+        return try await waitBoot { self.ciReadySeen }
     }
 
     private func waitBoot(_ ready: @escaping () -> Bool) async throws -> Bool {
@@ -565,39 +648,60 @@ final class InstallOrchestrator: ObservableObject {
     }
 
     /// Injects the stage's capture loop and re-arms the plateau detector at
-    /// the stage's cadence (CaptureCadence: stage 1 = 4.5 s + live re-seed,
-    /// stages 2/3 = 20 s persist-only with plateau at 3 equal ticks ≈ 60 s).
+    /// the stage's cadence (CaptureCadence: stage 1 = two-phase, 4.5 s +
+    /// live re-seed until 200k sectors then an in-page switch to 20 s
+    /// persist-only; stages 2/3 = 20 s persist-only always; plateau at
+    /// 3 equal ticks ≈ 60 s at the slow cadence, the only one plateaus can
+    /// fire at — their 300k minimum is past stage 1's switch).
     private func armCaptureLoop(_ stage: InstallFlow.Stage, shared: SharedEmulator, floor: Int) {
         currentStage = stage
         stageDetector = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: stage))
         plateauSeen = false
         lastCaptureAt = Date()
+        // Mirror the loop's baked `live` flag: a boot floored past the
+        // switch starts slow/persist-only, so nothing new reaches IndexedDB
+        // until the next boot boundary re-seed.
+        liveReseedActive = CaptureCadence.liveReseed(for: stage)
+            && (CaptureCadence.switchCount(for: stage).map { floor < $0 } ?? true)
         shared.webView.evaluateJavaScript(
             InstallJS.captureLoop(targetBase: targetBase, floor: floor,
                                   tickSeconds: CaptureCadence.tickSeconds(for: stage),
-                                  liveReseed: CaptureCadence.liveReseed(for: stage)),
+                                  liveReseed: CaptureCadence.liveReseed(for: stage),
+                                  reseedSwitchCount: CaptureCadence.switchCount(for: stage),
+                                  switchedTickSeconds: CaptureCadence.slowTickSeconds),
             completionHandler: nil)
     }
 
     /// The monotonic floor injected into this boot's capture loop: the record
-    /// count of the checkpoint the page just re-seeded (stage 2/3 boots read
-    /// it straight off stage.bin's header), NOT the run's global high water.
-    /// A stage-2 retry deliberately restores an OLDER checkpoint — flooring
-    /// at the high water would make the page drop every persist as regressed
-    /// (no accepted captures, no live re-seed, and a spurious silence death)
-    /// until Setup re-crossed the stale mark. Stage 1 has no checkpoint yet;
-    /// unreadable headers fall back to the conservative high water.
+    /// count of the checkpoint the page actually RESUMES from, NOT the run's
+    /// global high water. A retry deliberately restores an OLDER state —
+    /// flooring at the high water would make the page drop every persist as
+    /// regressed (no accepted captures, no live re-seed, and a spurious
+    /// silence death) until Setup re-crossed the stale mark.
+    ///  - Any boot with a pulled checkpoint re-seeds stage.bin (stages 2/3
+    ///    always; stage-1 recovery boots since device run #4) — floor at its
+    ///    header count.
+    ///  - A stage-1 boot WITHOUT a checkpoint resumes straight off
+    ///    IndexedDB, which holds exactly the live-re-seeded state — floor at
+    ///    the last count the page provably re-seeded (0 on the first boot).
+    ///    Past the cadence switch the high water runs ahead of the store, so
+    ///    flooring there would reject the whole resumed re-climb.
+    ///  - Stages 2/3 with an unreadable stage.bin keep the conservative
+    ///    high-water fallback (they never reach it in practice: every
+    ///    transition into them pulls a checkpoint first).
     private func captureFloor(for stage: InstallFlow.Stage, folder: URL) -> Int {
-        guard stage != .stage1 else { return captureHighWater }
+        if let count = stageBinRecordCount(folder) { return count }
+        return stage == .stage1 ? lastLiveReseedCount : captureHighWater
+    }
+
+    /// stage.bin's u32le record-count header, nil if absent/unreadable.
+    private func stageBinRecordCount(_ folder: URL) -> Int? {
         guard let handle = try? FileHandle(forReadingFrom: stageBinFileURL(folder)) else {
-            return captureHighWater
+            return nil
         }
         defer { try? handle.close() }
-        guard let header = try? handle.read(upToCount: 4), header.count == 4,
-              let count = sockdriveOverlayRecordCount(header) else {
-            return captureHighWater
-        }
-        return count
+        guard let header = try? handle.read(upToCount: 4), header.count == 4 else { return nil }
+        return sockdriveOverlayRecordCount(header)
     }
 
     /// What stage 2 actually did before dying — read at death time, fed to
