@@ -277,6 +277,7 @@ unit tests.
   web layer's navigation policy refuses every scheme except the app's own
   bundle scheme (`Sources/EmulatorWebView.swift`), so the emulator cannot
   wander onto the network.
+- **Privacy policy:** [PRIVACY.md](PRIVACY.md) — the app collects nothing.
 - **App Store:** distribution of this js-dos-based app through the App Store
   is gated on the js-dos author's consent (tracked in `SPEC.md` B9/M68); the
   repo and TestFlight-style personal builds are not.
