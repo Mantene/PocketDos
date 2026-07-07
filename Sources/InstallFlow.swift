@@ -31,7 +31,13 @@ import Foundation
 // 1's ends change too: its phase-1 completion warm reboot now surfaces as a
 // REGRESSED run (the remount re-reads the stale store) and is treated like
 // the plateau, and its mid-stage death recoveries boot parked and re-seed
-// the pulled checkpoint exactly like stages 2/3 boot boundaries.
+// the pulled checkpoint exactly like stages 2/3 boot boundaries. A [panic]
+// additionally gets a post-panic FINAL FLUSH (InstallJS.finalFlush — the
+// device-run-#5 fix): the WASM dies but the PAGE survives, and sockdrive
+// persist() is pure client-side JS, so the panic-instant disk state (the
+// continuation flags Windows writes in its final seconds before the restart
+// that panics this wasm — inside the capture-cadence gap otherwise) is
+// flushed into `__lastGood` BEFORE the checkpoint pull.
 
 // MARK: - Breadcrumb parsing
 
@@ -735,6 +741,80 @@ enum InstallJS {
           if (window.pdosInstallGo) { window.pdosInstallGo(); }
           else { console.log("[pdos-install] go-missing"); }
         })();
+        """
+    }
+
+    /// The post-panic FINAL FLUSH, device run #5's fix. From the 424,60x
+    /// checkpoint every stage-2 boot re-ran the same post-hardware-setup pass
+    /// for 60-90 s and then PANICKED at Windows' next restart — and the
+    /// continuation/progress flags Windows writes in its final seconds fell
+    /// inside the 20 s capture-cadence gap, so every reseed booted the
+    /// PRE-restart state and the pass repeated until the death budget
+    /// drained. (Chrome's prototype crossed the same transition only because
+    /// its 4.5 s tick happened to catch those final writes.) The surgical
+    /// answer is to capture AT THE PANIC INSTANT instead of ticking faster:
+    /// a [panic] kills the WASM but not the PAGE, and the vendored
+    /// CommandInterface serves sockdrive persists entirely client-side —
+    /// `persist(true)` calls `persistSockdrives()` FIRST and returns its
+    /// result without any wasm round-trip — so it still works over a dead
+    /// backend.
+    ///
+    /// One-shot, built for callAsyncJavaScript (a `return`ing async body,
+    /// NOT a fire-and-forget IIFE): the orchestrator AWAITS it before the
+    /// checkpoint pull, because the pull pins whatever `__lastGood` holds
+    /// when pdosCapPullBegin runs. It uses the page's ci-ready stash
+    /// `__pdosCi` (js-dos may drop its own reference on backend exit;
+    /// `window.ci` is the fallback), extracts the target drive's blob
+    /// exactly like the capture loop (matched by exact base URL, same u32le
+    /// header read), and promotes it to `__lastGood` only if its count
+    /// clears BOTH the boot's floor and whatever `__lastGood` already holds.
+    /// `>=` on both arms, on purpose: the final flags often rewrite the SAME
+    /// sectors, so the count may not grow at all — the BYTES are what
+    /// changed, and an equal-count flush must still replace the held blob.
+    /// Success logs "final-flush <count>"; every other path logs
+    /// "final-flush-failed …" and leaves `__lastGood` untouched. Everything
+    /// is wrapped so it can never throw into the page, and the persist is
+    /// raced against a 15 s timeout so the native await stays bounded even
+    /// if a strained page's persist wedges.
+    static func finalFlush(targetBase: String, floor: Int) -> String {
+        """
+        try {
+          var ci = window.__pdosCi || window.ci;
+          if (!ci || typeof ci.persist !== "function") {
+            console.log("[pdos-install] final-flush-failed no-ci");
+            return false;
+          }
+          var out = await Promise.race([
+            ci.persist(true),
+            new Promise(function (resolve, reject) {
+              setTimeout(function () { reject(new Error("persist timeout")); }, 15000);
+            })
+          ]);
+          var bytes = null;
+          if (out && out.drives) {
+            for (var i = 0; i < out.drives.length; i++) {
+              if (out.drives[i].url === \(quoted(targetBase))) { bytes = out.drives[i].persist; break; }
+            }
+          }
+          if (!bytes || !bytes.subarray || bytes.length < 4) {
+            console.log("[pdos-install] final-flush-failed no-target-blob");
+            return false;
+          }
+          var count = (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
+          var held = window.__lastGood;
+          var heldCount = (held && held.length >= 4)
+            ? ((held[0] | (held[1] << 8) | (held[2] << 16) | (held[3] << 24)) >>> 0) : 0;
+          if (count >= \(max(0, floor)) && count >= heldCount) {
+            window.__lastGood = bytes;
+            console.log("[pdos-install] final-flush " + count);
+            return true;
+          }
+          console.log("[pdos-install] final-flush-failed below-floor " + count);
+          return false;
+        } catch (e) {
+          console.log("[pdos-install] final-flush-failed " + (e && e.message ? e.message : e));
+          return false;
+        }
         """
     }
 }

@@ -704,6 +704,12 @@
           }
           if (event === "ci-ready") {
             window.ci = arg;
+            // Install mode: stash the CommandInterface where a backend exit can't
+            // lose it — js-dos may drop its own ci reference when the wasm dies,
+            // but sockdrive persist() is pure client-side JS (persistSockdrives
+            // runs FIRST, no wasm round-trip), so the orchestrator's post-panic
+            // final flush still captures through this stash (device run #5 fix).
+            if (window.__pdosInstall) window.__pdosCi = arg;
             const t = sockMs();
             log("running — ci-ready" + (t !== null ? " [sockspike +" + t + "ms to ci-ready]" : ""));
             if (window.__pdosInstall) console.log("[pdos-install] ci-ready");

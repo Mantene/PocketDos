@@ -681,6 +681,94 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] stage1-complete pull-failed"))
     }
 
+    // MARK: - Post-panic final flush (device fix, run #5)
+
+    // Orchestrator sequencing note: flush-then-pull ordering is enforced in
+    // InstallOrchestrator.finalFlushIfPanicked's call sites (the pull pins
+    // whatever __lastGood holds at pdosCapPullBegin time, so the flush is
+    // AWAITED first). That sequencing runs against a live WKWebView and is
+    // not unit-testable here — the builder below is pinned exhaustively
+    // instead, and the ordering is documented at every call site.
+
+    /// Builds the flush exactly as finalFlushIfPanicked does.
+    private func finalFlushJS(floor: Int = 424_609) -> String {
+        InstallJS.finalFlush(targetBase: "pocketdos://app/lib/ABC/target-drive/drive",
+                             floor: floor)
+    }
+
+    func testFinalFlushJSCarriesTheLoadBearingPieces() {
+        // Device run #5: from the 424,60x checkpoint every boot re-ran the
+        // same post-hardware-setup pass and panicked at its restart — the
+        // continuation flags Windows wrote in its final seconds fell inside
+        // the 20 s cadence gap, so every reseed booted the PRE-restart
+        // state. The flush captures AT the panic instant: persist() serves
+        // sockdrives entirely client-side (persistSockdrives runs FIRST, no
+        // wasm round-trip), so a dead backend doesn't stop it.
+        let js = finalFlushJS()
+        XCTAssertTrue(js.contains("window.__pdosCi || window.ci"),
+                      "js-dos may drop its own ci reference on backend exit — the "
+                      + "page's ci-ready stash is the reference that survives the panic")
+        XCTAssertTrue(js.contains("ci.persist(true)"))
+        XCTAssertTrue(js.contains("\"pocketdos://app/lib/ABC/target-drive/drive\""),
+                      "the target base must be matched EXACTLY, like the capture loop "
+                      + "(two sockdrives are mounted — a positional grab could take the CAB source)")
+        XCTAssertTrue(js.contains("(bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0"),
+                      "same u32le header read as the capture loop")
+        XCTAssertTrue(js.contains("window.__lastGood = bytes"),
+                      "the flushed blob must land where the pull channel (pdosCapPullBegin) reads")
+        XCTAssertTrue(js.contains("[pdos-install] final-flush "))
+        XCTAssertTrue(js.contains("[pdos-install] final-flush-failed"))
+    }
+
+    func testFinalFlushJSGuardsOnBothTheFloorAndTheHeldCheckpoint() {
+        // >= on BOTH arms, on purpose: the final pre-restart flags often
+        // rewrite the SAME sectors, so the record count may not grow at all
+        // — the BYTES are what changed, and an equal-count flush must still
+        // replace __lastGood. Anything below the boot's floor (e.g. a
+        // post-remount stale re-climb's persist, when a panic ends a reboot
+        // boundary) must leave it untouched.
+        let js = finalFlushJS(floor: 424_609)
+        XCTAssertTrue(js.contains("count >= 424609 && count >= heldCount"))
+        XCTAssertTrue(js.contains("held.length >= 4"),
+                      "a malformed held blob reads as count 0, never a crash")
+        XCTAssertTrue(finalFlushJS(floor: -3).contains("count >= 0 && count >= heldCount"),
+                      "a negative floor clamps to 0, like the capture loop's")
+    }
+
+    func testFinalFlushJSNeverThrowsIntoThePageAndStaysBounded() throws {
+        // The flush runs over a page that just panicked, from a native
+        // `try? await` — every path must RESOLVE (breadcrumb + return),
+        // never throw, and the persist is raced against a timeout so the
+        // native await stays bounded even if a strained page's persist
+        // wedges.
+        let js = finalFlushJS()
+        XCTAssertTrue(js.hasPrefix("try {"),
+                      "everything is guarded — the first statement included")
+        XCTAssertTrue(js.contains("} catch (e) {"))
+        XCTAssertTrue(js.contains("await Promise.race"))
+        XCTAssertTrue(js.contains("persist timeout"))
+        XCTAssertTrue(js.contains("15000"))
+        XCTAssertFalse(js.hasPrefix("(function"),
+                       "a callAsyncJavaScript body the orchestrator AWAITS before the "
+                       + "pull, not a fire-and-forget IIFE")
+        // The catch path still breadcrumbs the failure (forensics for the
+        // pulled device log) and resolves — __lastGood untouched.
+        let catchAt = try XCTUnwrap(js.range(of: "} catch (e) {"))
+        let failLogAt = try XCTUnwrap(js.range(of: "final-flush-failed \" + (e"))
+        XCTAssertTrue(failLogAt.lowerBound > catchAt.lowerBound)
+    }
+
+    func testFinalFlushBreadcrumbsAreInformationalToTheParser() {
+        // Like script-cycle / desktop-probe lines: forensic only. They must
+        // never parse into events — a "final-flush-failed persist timeout"
+        // arriving mid-death-handling must not look like a capture or a
+        // second panic to the run loop.
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] final-flush 424609"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] final-flush-failed no-ci"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] final-flush-failed below-floor 424603"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] final-flush-failed persist timeout"))
+    }
+
     // MARK: - Stage-2 keystroke loop (device fix 2)
 
     func testSetupScriptCycleIsTheEnterChordEnterPattern() {

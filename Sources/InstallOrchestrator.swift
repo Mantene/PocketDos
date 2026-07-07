@@ -48,6 +48,20 @@ struct InstallError: Error {
 /// `pdosInstallGo` and re-seed the freshest pulled checkpoint first — the
 /// same boot-boundary transport stages 2/3 always use.
 ///
+/// Device run #5 fix: Windows' post-hardware-setup pass ends in ANOTHER
+/// restart that deterministically panics this wasm, and the continuation
+/// flags it writes in its final seconds fall inside the 20 s capture-cadence
+/// gap — so every reseed booted the PRE-restart state and the pass repeated
+/// (60-90 s of identical writes, count frozen at 424,609, then the panic)
+/// until four identical deaths drained the budget. A [panic] kills the WASM
+/// but not the PAGE, and sockdrive persist() is pure client-side JS: every
+/// panic-classified interruption now runs a one-shot FINAL FLUSH
+/// (InstallJS.finalFlush, off the page's `__pdosCi` ci-ready stash) that
+/// re-persists the panic-instant state into `__lastGood` BEFORE the
+/// checkpoint pull — capturing at the panic instant instead of ticking
+/// faster. Process kills skip it naturally: the page is gone, the evaluate
+/// throws, try? falls through to the pull's own failure fallback.
+///
 /// It observes the install page through the EXISTING console bridge — via the
 /// additive `EmulatorController.onConsoleLine` hook — and through
 /// `EmulatorController.loadError` (the Bridge reports engine panics and
@@ -148,6 +162,12 @@ final class InstallOrchestrator: ObservableObject {
     private var ciReadySeen = false
     private var waitingForGoSeen = false
     private var deathSeen = false
+    /// deathSeen's page-alive subset: a [panic] event (console breadcrumb or
+    /// a non-__CRASH__ loadError) — the WASM died but the page and its JS
+    /// heap survive, which is exactly the state the post-panic final flush
+    /// (device run #5) can still persist from. A process kill sets deathSeen
+    /// WITHOUT this.
+    private var panicSeen = false
     private var plateauSeen = false
     /// A regressed run fired: the guest rebooted in-page (stages 2/3 only —
     /// RegressedRunDetector.arms). Once true it stays true until the reload.
@@ -175,6 +195,11 @@ final class InstallOrchestrator: ObservableObject {
     /// Swift mirror of the injected loop's `live` flag (stage 1's fast
     /// phase): true while accepted captures are still being re-seeded live.
     private var liveReseedActive = false
+    /// The floor the CURRENT boot's capture loop was armed with. The final
+    /// flush (device run #5) guards on this same number, so its acceptance
+    /// rule is exactly the loop's own monotonic rule — NOT the run-global
+    /// high water, which a stage-2 retry deliberately resumes below.
+    private var currentCaptureFloor = 0
 
     deinit {
         masterTask?.cancel()
@@ -337,8 +362,11 @@ final class InstallOrchestrator: ObservableObject {
             ciReadySeen = true
         case .waitingForGo:
             waitingForGoSeen = true
-        case .panic, .processDied:
+        case .panic:
             deathSeen = true
+            panicSeen = true   // page alive — the final flush can still run
+        case .processDied:
+            deathSeen = true   // page GONE — the flush must not be attempted
         case .captured(let count, _):
             regressedRun.accepted()
             if liveReseedActive {
@@ -499,6 +527,10 @@ final class InstallOrchestrator: ObservableObject {
                     if interruptedDuringScript {
                         // Best-effort checkpoint refresh either way (the
                         // .died arm below explains the failure semantics).
+                        // A panic flushes the panic-instant state FIRST
+                        // (run #5): the pull pins __lastGood, so the flush
+                        // must be awaited before it.
+                        await finalFlushIfPanicked(shared: shared)
                         try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
                         if interruption == .guestReboot {
                             emitBreadcrumb("reboot-boundary", shared: shared)
@@ -528,6 +560,16 @@ final class InstallOrchestrator: ObservableObject {
                     next = flow.stageEnded()
                     restartStageClock = true
                 case .guestRebooted:
+                    // Run #5: a boundary can be panic-ENDED (the stale
+                    // re-climb panicking mid-way is run #3's signature, and
+                    // classification priority folds that death into the
+                    // boundary). The page is alive either way, so flush the
+                    // panic-instant state into __lastGood BEFORE the pulls
+                    // below; a pure (panic-free) boundary skips it — the
+                    // loop's last accepted capture is already the freshest
+                    // good state — and a stale post-remount persist is
+                    // rejected by the flush's own floor guard.
+                    await finalFlushIfPanicked(shared: shared)
                     switch RebootBoundaryResponse.response(for: stage) {
                     case .phase1Complete:
                         // Device run #4: with stage 1's two-phase loop,
@@ -574,11 +616,17 @@ final class InstallOrchestrator: ObservableObject {
                         next = flow.guestRebooted()
                     }
                 case .died:
-                    // Best-effort checkpoint refresh: after a [panic] the page
-                    // usually still answers (only the WASM died), and its
-                    // __lastGood is at most one capture tick old. After a
-                    // process kill this throws and the previous checkpoint
-                    // (the last successful pull into stage.bin) stands.
+                    // Flush FIRST, pull SECOND (run #5 — the pull pins
+                    // whatever __lastGood holds at pdosCapPullBegin time).
+                    // After a [panic] the page still answers (only the WASM
+                    // died): the flush re-persists the panic-instant state
+                    // into __lastGood, catching the writes Windows made in
+                    // its final seconds — without it they fall inside the
+                    // capture-cadence gap and the reseed boots the
+                    // PRE-restart state forever. After a process kill both
+                    // throw and the previous checkpoint (the last
+                    // successful pull into stage.bin) stands.
+                    await finalFlushIfPanicked(shared: shared)
                     try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
                     next = flow.died(
                         stage2Evidence: stage == .stage2 ? stage2DeathEvidence() : nil)
@@ -641,6 +689,7 @@ final class InstallOrchestrator: ObservableObject {
         ciReadySeen = false
         waitingForGoSeen = false
         deathSeen = false
+        panicSeen = false
         plateauSeen = false
         rebootBoundarySeen = false
         regressedRun = RegressedRunDetector()
@@ -655,6 +704,7 @@ final class InstallOrchestrator: ObservableObject {
     /// fire at — their 300k minimum is past stage 1's switch).
     private func armCaptureLoop(_ stage: InstallFlow.Stage, shared: SharedEmulator, floor: Int) {
         currentStage = stage
+        currentCaptureFloor = floor   // the final flush guards on the SAME floor
         stageDetector = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: stage))
         plateauSeen = false
         lastCaptureAt = Date()
@@ -854,6 +904,38 @@ final class InstallOrchestrator: ObservableObject {
                 plateauSeen = false
             }
         }
+    }
+
+    // MARK: - Post-panic final flush (device run #5)
+
+    /// Re-persists the target sockdrive INTO `__lastGood` at the panic
+    /// instant, so the pull that follows retrieves the writes Windows made
+    /// in its final seconds before the restart-that-panics (its
+    /// continuation flags — inside the 20 s cadence gap otherwise, which is
+    /// why every reseed used to boot the PRE-restart state and repeat the
+    /// pass forever: run #5's wall at 424,60x). The sockdrive path of
+    /// `ci.persist(true)` is pure client-side JS, so it works over the dead
+    /// WASM; the in-JS floor + held-count guard means a failed or stale
+    /// flush changes nothing.
+    ///
+    /// Runs on BOTH classifications of a panic — a reboot-boundary-priority
+    /// panic and a plain death — because the page is alive in both and the
+    /// flush strictly improves (or leaves) the checkpoint. It skips
+    /// naturally everywhere else:
+    ///  - process kill: `panicSeen` is false (and the page is gone anyway —
+    ///    the evaluate would throw and `try?` falls through);
+    ///  - capture silence / pure regressed runs: no panic, and the still-
+    ///    live capture loop already holds the freshest good `__lastGood`.
+    ///
+    /// ORDERING (load-bearing, not unit-testable without a WebView — the
+    /// call sites in runStages mirror this comment): the flush is AWAITED
+    /// BEFORE pullCapture, because the pull pins whatever `__lastGood`
+    /// holds at pdosCapPullBegin time. Flush-then-pull is the entire fix.
+    private func finalFlushIfPanicked(shared: SharedEmulator) async {
+        guard panicSeen else { return }
+        _ = try? await shared.webView.callAsyncJavaScript(
+            InstallJS.finalFlush(targetBase: targetBase, floor: currentCaptureFloor),
+            arguments: [:], in: nil, contentWorld: .page)
     }
 
     // MARK: - Capture pull (mirrors the pdosPersistBegin/Chunk/End transport)
