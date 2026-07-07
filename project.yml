@@ -30,9 +30,11 @@ targets:
       # (Web/emulators/..., Web/games/...) is preserved verbatim in the app bundle.
       - path: Web
         type: folder
+      - path: Assets.xcassets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.mantene.pocketdos
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: Sources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/PocketDOS.entitlements
