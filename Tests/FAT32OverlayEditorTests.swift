@@ -40,13 +40,15 @@ enum FAT32Fixture {
     static func lba(ofCluster cluster: Int) -> Int { dataLBA + (cluster - 2) * sectorsPerCluster }
 
     // Cluster map: 2=root, 3=WINDOWS, 4=SYSTEM.INI, 5→9→6=README.TXT,
-    // 7=WINDOWS\SYSTEM (full), 8=FREE GAP, 10+ free.
+    // 7=WINDOWS\SYSTEM (full), 8=FREE GAP, 10+ free (10 = MSDOS.SYS when the
+    // image is built with one — tests that allocate must not also pass one).
     static let rootCluster = 2
     static let windowsCluster = 3
     static let systemINICluster = 4
     static let readmeChain = [5, 9, 6]
     static let systemDirCluster = 7
     static let freeGapCluster = 8
+    static let msdosSYSCluster = 10
 
     static let endOfChain: UInt32 = 0x0FFF_FFFF
     static let fixtureFreeCount: UInt32 = 993
@@ -69,6 +71,29 @@ enum FAT32Fixture {
     ]
     static var systemINI: Data { Data(systemINILines.joined(separator: "\r\n").utf8) }
 
+    /// A real Win98 SE MSDOS.SYS shape, shrunk: [Paths], [Options] with
+    /// AutoScan=1, then the "needs to be >1024 bytes" comment filler
+    /// (trimmed here — the fixture cluster is 1024 bytes).
+    static let msdosSYSLines = [
+        "[Paths]",
+        "WinDir=C:\\WINDOWS",
+        "WinBootDir=C:\\WINDOWS",
+        "HostWinBootDrv=C",
+        "",
+        "[Options]",
+        "BootMulti=1",
+        "BootGUI=1",
+        "DoubleBuffer=1",
+        "AutoScan=1",
+        "WinVer=4.10.2222",
+        ";",
+        ";The following lines are required for compatibility with other programs.",
+        ";Do not remove them (MSDOS.SYS needs to be >1024 bytes).",
+        ";xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxa",
+        "",
+    ]
+    static var msdosSYS: Data { Data(msdosSYSLines.joined(separator: "\r\n").utf8) }
+
     static let readmeContent: Data = {
         var bytes = [UInt8]()
         for i in 0..<2500 { bytes.append(UInt8(truncatingIfNeeded: i &* 37 &+ 11)) }
@@ -78,7 +103,10 @@ enum FAT32Fixture {
     /// The whole disk as one image, padded to five 256 KiB chunks. Everything
     /// nonzero lands in chunk 0; chunks 1-4 stay all-zero so `chunks()` drops
     /// them, giving the missing-chunk-reads-as-zeros case for free.
-    static func image(systemINI iniContent: Data = systemINI) -> Data {
+    /// `msdosSYS` (nil = absent, the historic fixture) adds C:\MSDOS.SYS with
+    /// the real file's +r+s+h+archive attributes at cluster 10.
+    static func image(systemINI iniContent: Data = systemINI,
+                      msdosSYS msdosContent: Data? = nil) -> Data {
         precondition(iniContent.count <= clusterBytes)
         var img = [UInt8](repeating: 0, count: (partitionStart + totalSectors) * sectorSize)
 
@@ -137,6 +165,7 @@ enum FAT32Fixture {
         fat[9] = 6
         fat[6] = endOfChain
         fat[systemDirCluster] = endOfChain
+        if msdosContent != nil { fat[msdosSYSCluster] = endOfChain }
         for copy in 0..<fatCount {
             let base = (fat1LBA + copy * fatSectors) * sectorSize
             for (i, value) in fat.enumerated() { put32(&img, base + i * 4, Int(value)) }
@@ -157,6 +186,17 @@ enum FAT32Fixture {
                                                  cluster: windowsCluster, size: 0))
         replace(&img, at: root + 128, with: entry(name11: name11("README  TXT"), attr: 0x20,
                                                   cluster: 5, size: readmeContent.count))
+        if let msdosContent {
+            precondition(msdosContent.count <= clusterBytes)
+            // attr 0x27 = read-only + hidden + system + archive: the real
+            // MSDOS.SYS attributes — an in-place edit must leave them alone.
+            replace(&img, at: root + 160, with: entry(name11: name11("MSDOS   SYS"), attr: 0x27,
+                                                      cluster: msdosSYSCluster,
+                                                      size: msdosContent.count))
+            let at = lba(ofCluster: msdosSYSCluster) * sectorSize
+            for i in 0..<clusterBytes { img[at + i] = 0xCC }   // slack poison
+            replace(&img, at: at, with: [UInt8](msdosContent))
+        }
 
         // WINDOWS (cluster 3): dot entries, SYSTEM.INI, SYSTEM.
         let win = lba(ofCluster: windowsCluster) * sectorSize
@@ -286,8 +326,10 @@ enum FAT32Fixture {
 final class FAT32OverlayEditorTests: XCTestCase {
 
     private func makeEditor(overlay: Data = FAT32Fixture.emptyOverlay,
-                            systemINI: Data = FAT32Fixture.systemINI) throws -> FAT32OverlayEditor {
-        let chunks = FAT32Fixture.chunks(image: FAT32Fixture.image(systemINI: systemINI))
+                            systemINI: Data = FAT32Fixture.systemINI,
+                            msdosSYS: Data? = nil) throws -> FAT32OverlayEditor {
+        let chunks = FAT32Fixture.chunks(image: FAT32Fixture.image(systemINI: systemINI,
+                                                                   msdosSYS: msdosSYS))
         return try FAT32OverlayEditor(overlay: overlay) { chunks[$0] }
     }
 
@@ -635,6 +677,93 @@ final class FAT32OverlayEditorTests: XCTestCase {
         XCTAssertEqual(editor.appendedRecords, 0)
         XCTAssertEqual(editor.overlay, FAT32Fixture.emptyOverlay,
                        "validation happens before the first write: no partial fix")
+    }
+
+    // MARK: - MSDOS.SYS AutoScan patch (dirty-boot ScanDisk suppression)
+
+    func testPatchMSDOSSYSFlipsAutoScan1To0AndNothingElse() throws {
+        let patched = try FAT32OverlayEditor.patchMSDOSSYS(FAT32Fixture.msdosSYS)
+        var expected = FAT32Fixture.msdosSYSLines
+        expected[9] = "AutoScan=0"
+        XCTAssertEqual(patched, Data(expected.joined(separator: "\r\n").utf8),
+                       "exactly one line changes; [Paths], WinVer, the size filler and "
+                       + "every CRLF survive verbatim")
+        XCTAssertEqual(patched.count, FAT32Fixture.msdosSYS.count,
+                       "=1 → =0 is size-neutral (MSDOS.SYS must stay >1024 bytes on the "
+                       + "real file, and in-place replacement must never need growth here)")
+    }
+
+    func testPatchMSDOSSYSInsertsUnderOptionsWhenAbsentAndIsSectionScoped() throws {
+        // An AutoScan lookalike OUTSIDE [Options] must not satisfy (or be
+        // touched by) the patch — the line belongs to the [Options] section.
+        let lines = ["AutoScan=1", "[Options]", "BootGUI=1", "[Paths]", "AutoScan=1"]
+        let patched = try FAT32OverlayEditor.patchMSDOSSYS(
+            Data(lines.joined(separator: "\r\n").utf8))
+        XCTAssertEqual(patched, Data(["AutoScan=1", "[Options]", "AutoScan=0", "BootGUI=1",
+                                      "[Paths]", "AutoScan=1"].joined(separator: "\r\n").utf8),
+                       "inserted right under the [Options] header; lookalikes untouched")
+    }
+
+    func testPatchMSDOSSYSAlreadyZeroReturnsTheInputByteIdentical() throws {
+        var lines = FAT32Fixture.msdosSYSLines
+        lines[9] = "AutoScan=0"
+        let content = Data(lines.joined(separator: "\r\n").utf8)
+        XCTAssertEqual(try FAT32OverlayEditor.patchMSDOSSYS(content), content,
+                       "already-off must be a recognizable no-op so callers skip the write")
+    }
+
+    func testPatchMSDOSSYSWithoutOptionsSectionThrows() {
+        let content = Data("[Paths]\r\nWinDir=C:\\WINDOWS\r\n".utf8)
+        XCTAssertThrowsError(try FAT32OverlayEditor.patchMSDOSSYS(content)) {
+            XCTAssertEqual($0 as? FAT32OverlayEditor.EditorError, .missingLine("[Options]"))
+        }
+    }
+
+    func testApplyAutoScanOffPatchesTheVolumeInPlaceKeepingAttributes() throws {
+        let editor = try makeEditor(msdosSYS: FAT32Fixture.msdosSYS)
+        try editor.applyAutoScanOff()
+
+        var expected = FAT32Fixture.msdosSYSLines
+        expected[9] = "AutoScan=0"
+        XCTAssertEqual(try editor.readFile(path: "MSDOS.SYS"),
+                       Data(expected.joined(separator: "\r\n").utf8))
+
+        // +r+s+h+archive survive: replaceFile rewrites content and the size
+        // field only, never the attribute byte (Windows still needs to see
+        // its boot file as system+hidden).
+        let root = try editor.readSector(FAT32Fixture.lba(ofCluster: FAT32Fixture.rootCluster))
+        XCTAssertEqual(root[root.startIndex + 160 + 11], 0x27, "attribute byte untouched")
+    }
+
+    func testApplyAutoScanOffAlreadyZeroWritesNothing() throws {
+        var lines = FAT32Fixture.msdosSYSLines
+        lines[9] = "AutoScan=0"
+        let editor = try makeEditor(msdosSYS: Data(lines.joined(separator: "\r\n").utf8))
+        try editor.applyAutoScanOff()
+        XCTAssertEqual(editor.appendedRecords, 0)
+        XCTAssertEqual(editor.overlay, FAT32Fixture.emptyOverlay,
+                       "an already-off AutoScan must not grow the shipped overlay")
+    }
+
+    func testApplyAutoScanOffOversizeThrowsWithoutWriting() throws {
+        // MSDOS.SYS grown to EXACTLY its chain capacity with no AutoScan
+        // line: the 12-byte insertion would overflow, and in-place
+        // replacement never grows a file — refuse with the overlay untouched
+        // (the orchestrator treats this best-effort: log, ship as-is).
+        var lines = FAT32Fixture.msdosSYSLines
+        lines.removeAll { $0 == "AutoScan=1" }
+        var text = lines.joined(separator: "\r\n")
+        text += String(repeating: "x", count: FAT32Fixture.clusterBytes - text.utf8.count)
+        let editor = try makeEditor(msdosSYS: Data(text.utf8))
+
+        XCTAssertThrowsError(try editor.applyAutoScanOff()) { error in
+            guard case FAT32OverlayEditor.EditorError.contentTooLarge = error else {
+                return XCTFail("expected contentTooLarge, got \(error)")
+            }
+        }
+        XCTAssertEqual(editor.appendedRecords, 0)
+        XCTAssertEqual(editor.overlay, FAT32Fixture.emptyOverlay,
+                       "shape validation and the capacity check both precede any write")
     }
 
     // MARK: - Overlay append format

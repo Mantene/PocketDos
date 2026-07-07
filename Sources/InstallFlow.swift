@@ -14,6 +14,10 @@ import Foundation
 //            is an engine crash, not the shutdown, and re-runs the stage.
 //   stage 3  recovery boot C: (hands-off) → desktop → final capture, with
 //            every write plateau PROBED before it is trusted as the desktop
+// In stages 2/3, a guest reboot the page SURVIVES (no panic — frequent on
+// device) remounts STALE boot-boundary IndexedDB; two consecutive regressed
+// captures detect it and the stage reloads on the freshest pulled
+// checkpoint, unbudgeted (RegressedRunDetector — the device-run-#3 fix),
 // with the install state carried between stages as the target sockdrive's
 // write-overlay blob, captured in-page via `ci.persist(true)` on a per-stage
 // cadence (CaptureCadence). Stage 1 re-seeds every accepted capture LIVE into
@@ -35,8 +39,10 @@ enum InstallBreadcrumb: Equatable {
     /// The capture loop accepted a persist pass: `count` = u32le sector-record
     /// count at overlay byte 0, `bytes` = whole blob length.
     case captured(count: Int, bytes: Int)
-    /// The capture loop saw a persist BELOW the accepted floor and dropped it
-    /// (normal around guest reboots — persist can return a partial set).
+    /// The capture loop saw a persist BELOW the accepted floor and dropped it.
+    /// ONE is noise (a persist racing a guest reboot can return a partial
+    /// set); a RUN of them in stages 2/3 is the in-page guest-reboot signal
+    /// (RegressedRunDetector — the device-run-#3 fix).
     case captureRegressed
     /// The engine died ([panic] re-emitted under the install prefix, or a
     /// bare [panic] line from the engine itself).
@@ -134,6 +140,72 @@ struct CapturePlateauDetector: Equatable {
     }
 }
 
+// MARK: - In-page guest-reboot detection (device run #3 fix)
+
+/// Detects a guest reboot the PAGE SURVIVED, from the capture-verdict
+/// breadcrumb stream (`captured` vs `capture-regressed`).
+///
+/// Stages 2/3 re-seed IndexedDB only at boot boundaries (the OOM fix), so
+/// when Setup's mid-phase-2/3 reboot does NOT panic the engine — common on
+/// device — the sockdrive remount re-reads the STALE boot-boundary state.
+/// The guest then re-runs already-finished work while the monotonic floor
+/// correctly rejects every persist: device run #3 sat through 15 consecutive
+/// `capture-regressed` ticks (300 s) until the silence watchdog fired, and
+/// the wasted re-climbs panicked mid-way often enough ("Out of bounds
+/// call_indirect" at 424,289, just shy of the 424,539 floor) to leave the
+/// FAT dirty — the ScanDisk complaints on later boots were this, not a
+/// separate bug. Through all of it the page stays ALIVE and
+/// `window.__lastGood` still holds the newest good pre-reboot snapshot
+/// (the floor rejected the regressed captures, so it was never clobbered) —
+/// exactly what the stage reload should pull and re-seed.
+///
+/// The in-memory sector store only ever GROWS between mounts, so while one
+/// rejection is normal reboot-race noise, two consecutive rejections mean a
+/// remount happened: answer with an IMMEDIATE stage reload on the freshest
+/// checkpoint. The 5-minute silence watchdog stays as the fallback, never
+/// the plan.
+struct RegressedRunDetector: Equatable {
+    /// Consecutive rejected persists that mean "the guest rebooted in-page".
+    static let bootBoundaryRun = 2
+
+    /// Stage 1 never arms the detector: its live per-tick re-seed keeps
+    /// IndexedDB current, so its warm reboots CONTINUE in-page by design —
+    /// and its 4.5 s cadence makes transient reboot-race rejections likelier.
+    static func arms(for stage: InstallFlow.Stage) -> Bool { stage != .stage1 }
+
+    private(set) var consecutiveRegressed = 0
+
+    /// Ingests one `capture-regressed` breadcrumb. True = boundary reached
+    /// (and it stays reached until an accepted capture breaks the run).
+    mutating func regressed() -> Bool {
+        consecutiveRegressed += 1
+        return consecutiveRegressed >= Self.bootBoundaryRun
+    }
+
+    /// Ingests one accepted capture: any acceptance breaks the run.
+    mutating func accepted() {
+        consecutiveRegressed = 0
+    }
+}
+
+/// How a running stage stopped early, in PRIORITY order: a death (panic /
+/// process kill) arriving during or after a fired regressed run is the SAME
+/// reboot boundary — the stale re-climb panicking mid-way was device run
+/// #3's signature — so it reloads with the freshest checkpoint instead of
+/// double-counting against the recovery budget.
+enum StageInterruption: Equatable {
+    /// Reload the stage, unbudgeted (the stage deadline is the only bound).
+    case guestReboot
+    /// Budgeted recovery (panic / process kill / capture silence).
+    case death
+
+    static func classify(rebootBoundary: Bool, death: Bool) -> StageInterruption? {
+        if rebootBoundary { return .guestReboot }
+        if death { return .death }
+        return nil
+    }
+}
+
 // MARK: - Stage state machine
 
 /// What stage 2 accomplished before it died — the discriminator between the
@@ -171,6 +243,11 @@ struct Stage2DeathEvidence: Equatable {
 ///  - a mid-stage death in stage 2 WITH finalize-shaped evidence is EXPECTED
 ///    (Windows' first shutdown kills the WASM) and transitions to stage 3
 ///    free of charge;
+///  - a mid-stage guest reboot the PAGE survived (2 consecutive regressed
+///    captures in stages 2/3, RegressedRunDetector) reloads the SAME stage
+///    free of charge too — a Win98 install legitimately reboots 2-3 times
+///    mid-phase-2/3, plus panic flake — bounded only by the stage deadline,
+///    which reboot-boundary reloads deliberately do NOT restart;
 ///  - any other mid-stage death (stage 1, stage 3, an EARLY stage-2 crash,
 ///    or capture silence >5 min) re-boots that stage — for stage 2 that
 ///    means re-seeding the checkpoint and RE-RUNNING the keystroke script —
@@ -194,6 +271,9 @@ struct InstallFlow: Equatable {
     private(set) var stage: Stage = .stage1
     private(set) var bootAttempt = 1
     private(set) var recoveryBoots = 0
+    /// In-page guest reboots answered with an unbudgeted stage reload —
+    /// counted for forensics only (the stage deadline bounds them, not this).
+    private(set) var rebootBoundaries = 0
 
     /// The opening move (after media build): boot stage 1, attempt 1.
     func begin() -> Next { .bootStage(.stage1, attempt: 1) }
@@ -229,6 +309,18 @@ struct InstallFlow: Equatable {
         case .stage3:
             return .finalizeReady
         }
+    }
+
+    /// The guest rebooted IN-PAGE and the page survived (stages 2/3: the
+    /// remount re-read stale boot-boundary IndexedDB, so the stage must
+    /// reload on the freshest pulled checkpoint). This is EXPECTED
+    /// Windows-Setup behavior — phase 2/3 legitimately reboots 2-3 times —
+    /// so it draws on NO death/recovery budget and resets the boot-attempt
+    /// episode; the stage deadline (not restarted by these) is the bound.
+    mutating func guestRebooted() -> Next {
+        rebootBoundaries += 1
+        bootAttempt = 1
+        return .bootStage(stage, attempt: 1)
     }
 
     /// The stage died mid-run: engine [panic], WebContent process gone, or
@@ -339,6 +431,11 @@ enum SetupScript {
 /// zero disk writes (flat → done), a waiting wizard page advances and
 /// writes (grew → keep watching for the next plateau). Breadcrumbed as
 /// "[pdos-install] desktop-probe flat|grew".
+///
+/// Incidental cover, known and relied on: if a dirty boot parks ScanDisk's
+/// "check the drive?" prompt at a plateau, the probe's Enter presses
+/// dismiss it and the boot continues (finalize's AutoScan=0 patch keeps
+/// the prompt from recurring on the SHIPPED machine).
 enum DesktopProbe {
     /// Probes per stage-3 boot; a plateau after the budget is trusted
     /// (finalize's mouse-fix guard stays the last backstop).

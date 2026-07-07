@@ -94,8 +94,8 @@ final class FAT32OverlayEditor {
             case .malformedVolume(let what):
                 return "The FAT32 volume is damaged: \(what)."
             case .missingLine(let line):
-                return "SYSTEM.INI is missing the expected line \"\(line)\" — refusing to "
-                    + "half-apply the mouse fix to an unrecognized configuration."
+                return "The file is missing the expected line \"\(line)\" — refusing to "
+                    + "half-apply an edit to an unrecognized configuration."
             }
         }
     }
@@ -345,6 +345,58 @@ final class FAT32OverlayEditor {
         }
         guard let patched = lines.joined(separator: "\r\n").data(using: .isoLatin1) else {
             throw EditorError.malformedVolume("patched SYSTEM.INI failed to re-encode")
+        }
+        return patched
+    }
+
+    /// Best-effort ScanDisk suppression for the shipped machine: ensures
+    /// `AutoScan=0` under [Options] in C:\MSDOS.SYS. Panic-interrupted
+    /// install re-runs leave the FAT crash-consistent ("dirty"), and Win98's
+    /// next boot then parks on ScanDisk's prompt — a stall on an unattended
+    /// boot. MSDOS.SYS is +r+s+h CRLF text with a >1 KB `;x…` comment filler;
+    /// attributes and every other byte survive (replaceFile rewrites content
+    /// and the size field only), the usual `AutoScan=1` → `=0` flip is
+    /// size-neutral, and an insertion adds 12 bytes — replaceFile's chain-
+    /// capacity check still guards the ceiling. Unlike applyMouseFix the
+    /// CALLER treats a throw here as non-fatal (log-and-ship); like it, an
+    /// unrecognized shape throws BEFORE anything is written.
+    func applyAutoScanOff() throws {
+        let path = "MSDOS.SYS"
+        let current = try readFile(path: path)
+        let patched = try Self.patchMSDOSSYS(current)
+        guard patched != current else { return }   // already AutoScan=0 — write nothing
+        try replaceFile(path: path) { _ in patched }
+    }
+
+    /// The MSDOS.SYS transform: within the [Options] section only, the
+    /// `AutoScan=` line becomes `AutoScan=0` (inserted right under the
+    /// section header when absent); every other byte — [Paths], the WinVer
+    /// line, the Mxxx `;x…` size filler, CRLF endings — survives verbatim.
+    /// Already-0 returns the input unchanged so the caller can skip the
+    /// write. No [Options] section (or undecodable content) is not the
+    /// MSDOS.SYS shape this was written against: throw, caller decides how
+    /// loud to be.
+    static func patchMSDOSSYS(_ content: Data) throws -> Data {
+        guard let text = String(data: content, encoding: .isoLatin1) else {
+            throw EditorError.malformedVolume("MSDOS.SYS is not decodable text")
+        }
+        var lines = text.components(separatedBy: "\r\n")
+        guard let options = lines.firstIndex(where: {
+            $0.caseInsensitiveCompare("[Options]") == .orderedSame
+        }) else {
+            throw EditorError.missingLine("[Options]")
+        }
+        let sectionEnd = lines[(options + 1)...].firstIndex { $0.hasPrefix("[") } ?? lines.endIndex
+        if let hit = lines[(options + 1)..<sectionEnd].firstIndex(where: {
+            $0.lowercased().hasPrefix("autoscan=")
+        }) {
+            if lines[hit] == "AutoScan=0" { return content }
+            lines[hit] = "AutoScan=0"
+        } else {
+            lines.insert("AutoScan=0", at: options + 1)
+        }
+        guard let patched = lines.joined(separator: "\r\n").data(using: .isoLatin1) else {
+            throw EditorError.malformedVolume("patched MSDOS.SYS failed to re-encode")
         }
         return patched
     }

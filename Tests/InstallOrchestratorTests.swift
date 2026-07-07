@@ -342,6 +342,114 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertEqual(flow.recoveryBoots, 1)
     }
 
+    // MARK: - In-page guest-reboot boundary (device fix, run #3)
+
+    func testTwoConsecutiveRegressionsAreTheRebootBoundary() {
+        // Device run #3: a guest reboot the page SURVIVED remounted stale
+        // boot-boundary IndexedDB, and the floor then rejected 15 straight
+        // ticks (300 s) before the silence watchdog fired. Two consecutive
+        // rejections are conclusive — the in-memory store only ever grows
+        // between mounts — and must be answered without the watchdog wait.
+        var run = RegressedRunDetector()
+        XCTAssertFalse(run.regressed(), "ONE rejection is persist/reboot race noise")
+        XCTAssertTrue(run.regressed(), "the second consecutive rejection IS the reboot")
+        XCTAssertTrue(run.regressed(), "and it stays fired until something is accepted")
+        XCTAssertEqual(RegressedRunDetector.bootBoundaryRun, 2)
+    }
+
+    func testAcceptedCaptureBreaksTheRegressedRun() {
+        var run = RegressedRunDetector()
+        _ = run.regressed()
+        run.accepted()                 // a good persist landed in between
+        XCTAssertFalse(run.regressed(), "the accepted capture reset the run")
+        XCTAssertTrue(run.regressed(), "two consecutive again — boundary again")
+    }
+
+    func testRegressedRunDetectorArmsOnlyForStages2And3() {
+        // Stage 1's live per-tick re-seed keeps IndexedDB current, so its
+        // warm reboots CONTINUE in-page by design — a reload there would
+        // throw away the working continuation (and its 4.5 s cadence makes
+        // transient reboot-race rejections likelier to pair up).
+        XCTAssertFalse(RegressedRunDetector.arms(for: .stage1))
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage2))
+        XCTAssertTrue(RegressedRunDetector.arms(for: .stage3))
+    }
+
+    func testInterruptionClassificationPrefersTheRebootBoundary() {
+        XCTAssertNil(StageInterruption.classify(rebootBoundary: false, death: false))
+        XCTAssertEqual(StageInterruption.classify(rebootBoundary: false, death: true), .death)
+        XCTAssertEqual(StageInterruption.classify(rebootBoundary: true, death: false), .guestReboot)
+        // Run #3's signature: the stale re-climb panics mid-way ("Out of
+        // bounds call_indirect" at 424,289, just shy of the 424,539 floor).
+        // A death during/after a fired regressed run is the SAME boundary —
+        // fresh-checkpoint reload, no recovery-budget draw, never both.
+        XCTAssertEqual(StageInterruption.classify(rebootBoundary: true, death: true), .guestReboot)
+    }
+
+    func testGuestRebootReloadsTheStageWithoutBudgetDraw() {
+        var flow = flowAtStage2()
+        XCTAssertEqual(flow.guestRebooted(), .bootStage(.stage2, attempt: 1))
+        XCTAssertEqual(flow.stage, .stage2)
+        XCTAssertEqual(flow.recoveryBoots, 0, "reboot boundaries are EXPECTED, not deaths")
+        XCTAssertEqual(flow.rebootBoundaries, 1)
+    }
+
+    func testGuestRebootsNeverExhaustAnyBudget() {
+        // Win98 Setup legitimately reboots 2-3 times mid-phase-2/3, plus
+        // panic flake — only the stage deadline bounds these, never a count.
+        var flow = flowAtStage2()
+        for n in 1...10 {
+            XCTAssertEqual(flow.guestRebooted(), .bootStage(.stage2, attempt: 1))
+            XCTAssertEqual(flow.rebootBoundaries, n)
+        }
+        XCTAssertEqual(flow.recoveryBoots, 0)
+    }
+
+    func testGuestRebootLeavesTheDeathBudgetUntouchedInBothDirections() {
+        var flow = flowAtStage2()
+        _ = flow.died(stage2Evidence: earlyCrashDeath)       // recovery 1
+        flow.bootSucceeded()
+        XCTAssertEqual(flow.guestRebooted(), .bootStage(.stage2, attempt: 1))
+        XCTAssertEqual(flow.recoveryBoots, 1, "a boundary must not consume a recovery slot")
+        flow.bootSucceeded()
+        _ = flow.died(stage2Evidence: earlyCrashDeath)       // recovery 2
+        _ = flow.died(stage2Evidence: earlyCrashDeath)       // recovery 3
+        guard case .failed = flow.died(stage2Evidence: earlyCrashDeath) else {
+            return XCTFail("boundaries must not REFILL the death budget either")
+        }
+    }
+
+    func testStage3GuestRebootStaysInStage3() {
+        var flow = flowAtStage2()
+        _ = flow.died(stage2Evidence: finalizeShapedDeath)   // → stage 3 (expected)
+        flow.bootSucceeded()
+        XCTAssertEqual(flow.guestRebooted(), .bootStage(.stage3, attempt: 1))
+        XCTAssertEqual(flow.stage, .stage3)
+        XCTAssertEqual(flow.recoveryBoots, 0)
+    }
+
+    func testGuestRebootStartsAFreshBootEpisode() {
+        var flow = flowAtStage2()
+        _ = flow.bootFailed()                                // attempt 2 mid-episode
+        _ = flow.guestRebooted()
+        XCTAssertEqual(flow.bootFailed(), .bootStage(.stage2, attempt: 2),
+                       "the boundary reload gets the full 3-attempt boot budget")
+    }
+
+    // MARK: - Stage deadlines (device fix: stage 3 runs ScanDisk + a PnP re-pass)
+
+    @MainActor
+    func testStageDeadlineTable() {
+        // The deadline doubles as the ONLY bound on unbudgeted reboot-
+        // boundary reloads (runStages persists it across them), so these
+        // numbers are load-bearing, not decoration.
+        XCTAssertEqual(InstallOrchestrator.stageDeadline(.stage1), 45 * 60)
+        XCTAssertEqual(InstallOrchestrator.stageDeadline(.stage2), 30 * 60)
+        XCTAssertEqual(InstallOrchestrator.stageDeadline(.stage3), 25 * 60,
+                       "12 min was Chrome-calibrated; device stage 3 runs ScanDisk "
+                       + "passes and a PnP re-pass and needs the headroom")
+    }
+
     // MARK: - Injected JS builders
 
     func testCaptureLoopJSStage1CarriesTheLoadBearingPieces() {
@@ -414,6 +522,7 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] script-cycle 3"))
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] desktop-probe flat"))
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] desktop-probe grew"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] reboot-boundary"))
     }
 
     // MARK: - Stage-2 keystroke loop (device fix 2)

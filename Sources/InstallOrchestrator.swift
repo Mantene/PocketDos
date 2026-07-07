@@ -23,8 +23,17 @@ struct InstallError: Error {
 /// The mechanics are the Chrome-proven runbook, made timing-immune after the
 /// first device run (device Setup paints far slower than Chrome); the pure
 /// decision pieces (breadcrumb grammar, plateau rule, stage/retry machine,
-/// death classification, script/probe shapes) live in InstallFlow.swift
-/// where they are unit-tested.
+/// death classification, reboot-boundary detection, script/probe shapes)
+/// live in InstallFlow.swift where they are unit-tested.
+///
+/// Device run #3 fix: in stages 2/3 a guest reboot the page SURVIVES
+/// remounts stale boot-boundary IndexedDB (only boot boundaries re-seed
+/// there — the OOM fix), so the floor rejects every capture while the guest
+/// re-runs finished work. Two consecutive `capture-regressed` breadcrumbs
+/// now trigger an immediate, unbudgeted stage reload on the freshest
+/// `__lastGood` pulled from the still-alive page — no 5-minute silence
+/// wait, no recovery-slot draw, no crash-prone stale re-climbs dirtying
+/// the FAT.
 ///
 /// It observes the install page through the EXISTING console bridge — via the
 /// additive `EmulatorController.onConsoleLine` hook — and through
@@ -77,13 +86,17 @@ final class InstallOrchestrator: ObservableObject {
     /// dying gasps — dropping them keeps a stale panic from burning a fresh
     /// boot attempt. A genuinely instant panic still fails via the 90 s timeout.
     static let staleEventWindow: TimeInterval = 1.5
-    /// Per-stage hard deadlines (safety net over the runbook's expectations of
-    /// 15-25 min, ~13-17 min, and ~2-3 min respectively).
+    /// Per-stage hard deadlines (safety net over the runbook's expectations
+    /// of 15-25 min, ~13-17 min, and ~2-3 min in Chrome). Stage 3 gets 25 on
+    /// device: dirty-boot ScanDisk passes and a PnP re-pass land there, and
+    /// the old 12 was Chrome-calibrated. The clock deliberately SURVIVES
+    /// reboot-boundary reloads (see runStages) — it is the ONLY bound on
+    /// those, since they draw no budget.
     static func stageDeadline(_ stage: InstallFlow.Stage) -> TimeInterval {
         switch stage {
         case .stage1: return 45 * 60
         case .stage2: return 30 * 60
-        case .stage3: return 12 * 60
+        case .stage3: return 25 * 60
         }
     }
     /// How long a stage-3 desktop probe waits for its settle ticks before
@@ -99,6 +112,7 @@ final class InstallOrchestrator: ObservableObject {
         case ciReady
         case waitingForGo
         case captured(count: Int, bytes: Int)
+        case captureRegressed
         case panic(String)
         case processDied
         case cancelled
@@ -121,7 +135,14 @@ final class InstallOrchestrator: ObservableObject {
     private var waitingForGoSeen = false
     private var deathSeen = false
     private var plateauSeen = false
+    /// A regressed run fired: the guest rebooted in-page (stages 2/3 only —
+    /// RegressedRunDetector.arms). Once true it stays true until the reload.
+    private var rebootBoundarySeen = false
     private var stageDetector = CapturePlateauDetector()
+    private var regressedRun = RegressedRunDetector()
+    /// The stage whose capture loop is armed — gates the regressed-run
+    /// detector (stage 1's warm reboots continue in-page by design).
+    private var currentStage: InstallFlow.Stage = .stage1
     private var lastCaptureAt = Date()
     private var lastLoadAt = Date.distantPast
     private var goAt = Date()
@@ -245,7 +266,12 @@ final class InstallOrchestrator: ObservableObject {
             guard Date().timeIntervalSince(lastLoadAt) > Self.staleEventWindow else { return }
             post(.panic(text))
         case .captureRegressed:
-            break   // informational; the in-page guard already dropped it
+            // Same stale-gasp guard as panics: within the window the NEW
+            // page's capture loop cannot be armed yet (that takes ci-ready),
+            // so any regressed line this early is the OLD page flushing —
+            // it must not seed the fresh boot's regressed-run counter.
+            guard Date().timeIntervalSince(lastLoadAt) > Self.staleEventWindow else { return }
+            post(.captureRegressed)   // the run loop counts consecutive ones
         }
     }
 
@@ -287,13 +313,30 @@ final class InstallOrchestrator: ObservableObject {
         case .panic, .processDied:
             deathSeen = true
         case .captured(let count, _):
+            regressedRun.accepted()
             if stageDetector.ingest(count) == .plateau { plateauSeen = true }
             latestCaptureCount = count
             if case .stage1FileCopy = state { state = .stage1FileCopy(captureCount: count) }
+        case .captureRegressed:
+            // Device run #3: in stages 2/3 a surviving guest reboot remounts
+            // stale boot-boundary IndexedDB, so the in-page floor rejects
+            // every persist while the guest re-runs finished work. Two
+            // consecutive rejections ARE that reboot; stage 1 (live re-seed,
+            // in-page continuation) never arms this.
+            guard RegressedRunDetector.arms(for: currentStage) else { break }
+            if regressedRun.regressed() { rebootBoundarySeen = true }
         case .cancelled:
             break   // the loops' Task.checkCancellation() throws right after
         }
     }
+
+    /// The stop-early flags in classification priority: a death arriving
+    /// during/after a fired regressed run is the SAME reboot boundary
+    /// (StageInterruption.classify — pure, tested), never a second death.
+    private var interruption: StageInterruption? {
+        StageInterruption.classify(rebootBoundary: rebootBoundarySeen, death: deathSeen)
+    }
+    private var interrupted: Bool { interruption != nil }
 
     // MARK: - Media build
 
@@ -377,6 +420,13 @@ final class InstallOrchestrator: ObservableObject {
 
         var flow = InstallFlow()
         var next = flow.begin()
+        // The stage-deadline CLOCK. (Re)started by budgeted transitions into
+        // a stage (begin / stageEnded / died) and deliberately NOT by
+        // reboot-boundary reloads or boot-attempt retries: reboot boundaries
+        // are unbudgeted (Setup legitimately reboots 2-3 times mid-phase-2/3
+        // — device run #3), so the persisted deadline is their only bound.
+        var stageDeadlineAt = Date.distantFuture
+        var restartStageClock = true
         while true {
             try Task.checkCancellation()
             switch next {
@@ -385,28 +435,39 @@ final class InstallOrchestrator: ObservableObject {
             case .finalizeReady:
                 return
             case .bootStage(let stage, _):
+                if restartStageClock {
+                    stageDeadlineAt = Date().addingTimeInterval(Self.stageDeadline(stage))
+                    restartStageClock = false
+                }
                 publishStageEntry(stage)
                 let booted = try await bootStage(stage, shared: shared)
                 guard booted else {
-                    next = flow.bootFailed()
+                    next = flow.bootFailed()   // boot retries keep the stage clock
                     continue
                 }
                 flow.bootSucceeded()
                 armCaptureLoop(stage, shared: shared, floor: captureFloor(for: stage, folder: folder))
                 if stage == .stage2 {
-                    let diedDuringScript = try await runSetupScript(shared: shared)
-                    if diedDuringScript {
+                    let interruptedDuringScript = try await runSetupScript(shared: shared)
+                    if interruptedDuringScript {
+                        // Best-effort checkpoint refresh either way (the
+                        // .died arm below explains the failure semantics).
                         try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
-                        next = flow.died(stage2Evidence: stage2DeathEvidence())
+                        if interruption == .guestReboot {
+                            emitBreadcrumb("reboot-boundary", shared: shared)
+                            next = flow.guestRebooted()
+                        } else {
+                            next = flow.died(stage2Evidence: stage2DeathEvidence())
+                            restartStageClock = true
+                        }
                         continue
                     }
                 }
                 let outcome: StageOutcome
                 if stage == .stage3 {
-                    outcome = try await watchStage3ToDesktop(shared: shared)
+                    outcome = try await watchStage3ToDesktop(shared: shared, until: stageDeadlineAt)
                 } else {
-                    outcome = try await watchStage(
-                        stage, until: Date().addingTimeInterval(Self.stageDeadline(stage)))
+                    outcome = try await watchStage(stage, until: stageDeadlineAt)
                 }
                 switch outcome {
                 case .plateau:
@@ -418,6 +479,22 @@ final class InstallOrchestrator: ObservableObject {
                         try await pullCapture(shared: shared, to: stageBinFileURL(folder))
                     }
                     next = flow.stageEnded()
+                    restartStageClock = true
+                case .guestRebooted:
+                    // Device run #3 fix: the guest rebooted IN-PAGE. Stages
+                    // 2/3 hold only the boot-boundary re-seed in IndexedDB,
+                    // so the remount handed the guest STALE state — left
+                    // alone it re-runs finished work for the floor to reject
+                    // (5-minute silence stall) and panics mid-climb often
+                    // enough to dirty the FAT. The page is still ALIVE and
+                    // __lastGood holds the newest pre-reboot snapshot: pull
+                    // it as the stage checkpoint NOW (a failed pull falls
+                    // back to the last pulled checkpoint, exactly like the
+                    // death path) and reload the stage — no watchdog wait,
+                    // no recovery-budget draw, stage clock keeps running.
+                    emitBreadcrumb("reboot-boundary", shared: shared)
+                    try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
+                    next = flow.guestRebooted()
                 case .died:
                     // Best-effort checkpoint refresh: after a [panic] the page
                     // usually still answers (only the WASM died), and its
@@ -427,6 +504,7 @@ final class InstallOrchestrator: ObservableObject {
                     try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
                     next = flow.died(
                         stage2Evidence: stage == .stage2 ? stage2DeathEvidence() : nil)
+                    restartStageClock = true
                 }
             }
         }
@@ -481,6 +559,8 @@ final class InstallOrchestrator: ObservableObject {
         waitingForGoSeen = false
         deathSeen = false
         plateauSeen = false
+        rebootBoundarySeen = false
+        regressedRun = RegressedRunDetector()
         eventQueue.removeAll()   // stale events die with the page they came from
     }
 
@@ -488,6 +568,7 @@ final class InstallOrchestrator: ObservableObject {
     /// the stage's cadence (CaptureCadence: stage 1 = 4.5 s + live re-seed,
     /// stages 2/3 = 20 s persist-only with plateau at 3 equal ticks ≈ 60 s).
     private func armCaptureLoop(_ stage: InstallFlow.Stage, shared: SharedEmulator, floor: Int) {
+        currentStage = stage
         stageDetector = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: stage))
         plateauSeen = false
         lastCaptureAt = Date()
@@ -532,8 +613,8 @@ final class InstallOrchestrator: ObservableObject {
     /// on device: Setup paints far slower there than in Chrome). After a
     /// quiet lead-in, keystroke cycles repeat — each safe wherever Setup
     /// happens to be — until the captures prove Setup advanced into its
-    /// copy/hardware work, the cycle cap runs out, or the engine dies.
-    /// Returns true if the engine died mid-script.
+    /// copy/hardware work, the cycle cap runs out, or the run is
+    /// interrupted (death or reboot boundary). Returns true on interruption.
     private func runSetupScript(shared: SharedEmulator) async throws -> Bool {
         state = .stage2Script(step: 0)
         if try await drain(until: goAt.addingTimeInterval(SetupScript.leadInSeconds)) { return true }
@@ -549,10 +630,11 @@ final class InstallOrchestrator: ObservableObject {
     }
 
     /// Interprets one keystroke cycle (SetupScript.cycle / DesktopProbe.cycle)
-    /// Swift-side, draining events through the waits. True = death seen.
+    /// Swift-side, draining events through the waits. True = interrupted
+    /// (death or reboot boundary — the caller classifies via `interruption`).
     private func perform(cycle: [ScriptStep], shared: SharedEmulator) async throws -> Bool {
         for step in cycle {
-            if deathSeen { return true }
+            if interrupted { return true }
             switch step {
             case .press(let js):
                 shared.webView.evaluateJavaScript(js, completionHandler: nil)
@@ -560,37 +642,37 @@ final class InstallOrchestrator: ObservableObject {
                 if try await drain(until: Date().addingTimeInterval(seconds)) { return true }
             }
         }
-        return deathSeen
+        return interrupted
     }
 
-    /// Drains install events until `deadline`. True = death seen (early out).
+    /// Drains install events until `deadline`. True = interrupted (early out).
     private func drain(until deadline: Date) async throws -> Bool {
         while Date() < deadline {
             try Task.checkCancellation()
-            if deathSeen { return true }
+            if interrupted { return true }
             if let event = await awaitEvent(timeout: max(0.1, deadline.timeIntervalSinceNow)) {
                 apply(event)
             }
         }
-        return deathSeen
+        return interrupted
     }
 
     /// Waits for `ticks` accepted captures (nominally ticks × the stage's
     /// capture cadence — 20 s where this is used, stage 3), bounded by
     /// `probeSettleTimeout` in case the in-page persist stalls. True =
-    /// death seen.
+    /// interrupted.
     private func awaitCaptureTicks(_ ticks: Int) async throws -> Bool {
         let deadline = Date().addingTimeInterval(Self.probeSettleTimeout)
         var seen = 0
         while seen < ticks, Date() < deadline {
             try Task.checkCancellation()
-            if deathSeen { return true }
+            if interrupted { return true }
             if let event = await awaitEvent(timeout: max(0.1, deadline.timeIntervalSinceNow)) {
                 if case .captured = event { seen += 1 }
                 apply(event)
             }
         }
-        return deathSeen
+        return interrupted
     }
 
     /// Best-effort forensic breadcrumb INTO the page console, so native-
@@ -600,19 +682,27 @@ final class InstallOrchestrator: ObservableObject {
         shared.webView.evaluateJavaScript(InstallJS.logBreadcrumb(tail), completionHandler: nil)
     }
 
-    private enum StageOutcome { case plateau, died }
+    private enum StageOutcome { case plateau, guestRebooted, died }
 
-    /// Supervises a booted stage until it settles or dies. Stage 2 never ends
-    /// by plateau (the runbook's end there is death or plateau-THEN-silence,
-    /// and equal-count captures keep arriving during a plateau, so the 5-min
-    /// silence watchdog is exactly the "then-silence" half). The deadline is
-    /// the caller's so stage 3's probe loop can resume watching WITHOUT
-    /// restarting the stage clock.
+    /// Maps the stop-early flags to a stage outcome once a helper reported
+    /// "interrupted" (priority lives in StageInterruption.classify: a death
+    /// during/after a fired regressed run is the same reboot boundary).
+    private func interruptedOutcome() -> StageOutcome {
+        interruption == .guestReboot ? .guestRebooted : .died
+    }
+
+    /// Supervises a booted stage until it settles, hits a reboot boundary,
+    /// or dies. Stage 2 never ends by plateau (the runbook's end there is
+    /// death or plateau-THEN-silence, and equal-count captures keep arriving
+    /// during a plateau, so the 5-min silence watchdog is exactly the
+    /// "then-silence" half — and the FALLBACK for a regressed run the
+    /// detector somehow missed). The deadline is the caller's: it survives
+    /// reboot-boundary reloads and stage 3's probe rounds alike.
     private func watchStage(_ stage: InstallFlow.Stage, until deadline: Date) async throws -> StageOutcome {
         lastCaptureAt = Date()
         while true {
             try Task.checkCancellation()
-            if deathSeen { return .died }
+            if interrupted { return interruptedOutcome() }
             if plateauSeen && stage != .stage2 { return .plateau }
             if Date().timeIntervalSince(lastCaptureAt) > Self.captureSilenceLimit { return .died }
             if Date() > deadline { return .died }
@@ -628,20 +718,24 @@ final class InstallOrchestrator: ObservableObject {
     /// grew → a wizard page ate the keys and advanced → resume watching for
     /// the next plateau on the SAME stage deadline. At most
     /// `DesktopProbe.maxProbes` probes per boot; after that the next plateau
-    /// is accepted (finalize's mouse-fix guard is the last backstop).
-    private func watchStage3ToDesktop(shared: SharedEmulator) async throws -> StageOutcome {
-        let deadline = Date().addingTimeInterval(Self.stageDeadline(.stage3))
+    /// is accepted (finalize's mouse-fix guard is the last backstop). The
+    /// deadline is the caller's persisted stage clock — a reboot boundary
+    /// (or a probe interrupted by one) surfaces as .guestRebooted and the
+    /// reloaded boot re-enters here with a fresh probe budget.
+    private func watchStage3ToDesktop(shared: SharedEmulator, until deadline: Date) async throws -> StageOutcome {
         var probes = 0
         while true {
             switch try await watchStage(.stage3, until: deadline) {
             case .died:
                 return .died
+            case .guestRebooted:
+                return .guestRebooted
             case .plateau:
                 guard probes < DesktopProbe.maxProbes else { return .plateau }
                 probes += 1
                 let baseline = captureHighWater
-                if try await perform(cycle: DesktopProbe.cycle, shared: shared) { return .died }
-                if try await awaitCaptureTicks(DesktopProbe.settleTicks) { return .died }
+                if try await perform(cycle: DesktopProbe.cycle, shared: shared) { return interruptedOutcome() }
+                if try await awaitCaptureTicks(DesktopProbe.settleTicks) { return interruptedOutcome() }
                 if DesktopProbe.isFlat(baseline: baseline, latest: captureHighWater) {
                     emitBreadcrumb("desktop-probe flat", shared: shared)
                     return .plateau
@@ -716,7 +810,8 @@ final class InstallOrchestrator: ObservableObject {
     // MARK: - Finalize (pure Swift, no emulator)
 
     /// stage.bin (the final captured overlay) + the blank-target chunks become
-    /// the library game: mouse-fix surgery on the overlay, chunks moved to
+    /// the library game: mouse-fix surgery on the overlay (plus best-effort
+    /// MSDOS.SYS AutoScan=0 — dirty-boot ScanDisk suppression), chunks moved to
     /// `drive/`, patched overlay written as `sockdrive-write.bin` (the S2
     /// restore path re-seeds it at every boot), GameStore-shaped meta.json,
     /// and every intermediate artifact deleted — nothing derived from the
@@ -737,6 +832,18 @@ final class InstallOrchestrator: ObservableObject {
             do {
                 let editor = try FAT32OverlayEditor(overlay: overlay, chunksDirectory: chunksDir)
                 try editor.applyMouseFix(driver: try Data(contentsOf: driverURL))
+                // Best-effort dirty-boot polish (device run #3): panic-
+                // interrupted stage re-runs leave the FAT crash-consistent,
+                // and Win98's next boot then parks on ScanDisk's prompt — a
+                // stall on every unattended boot of the SHIPPED machine.
+                // AutoScan=0 in MSDOS.SYS skips it. Unlike the mouse fix
+                // this must NOT fail the install: an unexpected MSDOS.SYS
+                // shape logs its breadcrumb and the machine ships as-is.
+                do {
+                    try editor.applyAutoScanOff()
+                } catch {
+                    print("[pdos-install] autoscan-skip \(error.localizedDescription)")
+                }
                 let driveDest = folder.appendingPathComponent("drive", isDirectory: true)
                 try? fm.removeItem(at: driveDest)
                 try fm.moveItem(at: chunksDir, to: driveDest)
