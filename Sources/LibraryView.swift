@@ -118,7 +118,7 @@ struct LibraryView: View {
                         Button {
                             sheet = .installWizard
                         } label: {
-                            Label("New Windows 98 machine…", systemImage: "opticaldisc")
+                            Label("New Windows 98 machine (Experimental)…", systemImage: "opticaldisc")
                         }
                     } label: {
                         Label("Add", systemImage: "plus")
