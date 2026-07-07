@@ -46,6 +46,8 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertNil(InstallBreadcrumb.parse("log: running — ci-ready"))          // no install prefix
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] phase=boot-a target=x src=y floppy=yes"))
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] capture-error persist timeout"))
+        XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-install] tick-ms 8342"),
+                     "the serialize-cost breadcrumb is forensic only, never an event")
         XCTAssertNil(InstallBreadcrumb.parse("log: [pdos-fps] raf=60.0 emu=60.0 act=0"))
         XCTAssertEqual(InstallBreadcrumb.parse("log: [pdos-install] capture-regressed 100 200"),
                        .captureRegressed)
@@ -131,6 +133,55 @@ final class InstallOrchestratorTests: XCTestCase {
         _ = d.ingest(150_000)                          // rejected partial persist
         XCTAssertEqual(d.firstAccepted, 388_979, "rejects must not move the baseline")
         XCTAssertEqual(d.growthSinceFirstAccepted, 12_711)
+    }
+
+    // MARK: - Capture transport cadence (device OOM fix)
+
+    func testCaptureCadenceTablePerStage() {
+        // stage → (tick, live re-seed, plateau ticks). Stage 1 keeps the
+        // proven 4.5 s + live re-seed (overlays start small; the re-seed is
+        // what lets phase-1's in-page warm reboot resume). Stages 2/3 tick at
+        // 20 s persist-only — serializing AND IndexedDB-copying the ~150 MB
+        // stage-2 overlay every 4.5 s is what Jetsam-killed the device run.
+        XCTAssertEqual(CaptureCadence.tickSeconds(for: .stage1), 4.5)
+        XCTAssertTrue(CaptureCadence.liveReseed(for: .stage1))
+        XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage1), 4)
+
+        XCTAssertEqual(CaptureCadence.tickSeconds(for: .stage2), 20)
+        XCTAssertFalse(CaptureCadence.liveReseed(for: .stage2))
+        XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage2), 3)
+
+        XCTAssertEqual(CaptureCadence.tickSeconds(for: .stage3), 20)
+        XCTAssertFalse(CaptureCadence.liveReseed(for: .stage3))
+        XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage3), 3)
+    }
+
+    func testPlateauFiresOnThirdEqualTickAtTheSlowCadence() {
+        // Stages 2/3 arm the detector with plateauTicks: 3 — at the 20 s tick
+        // that is ≈ 60 s of settled writes, the same wall-clock confidence the
+        // 4-tick rule gave at 4.5 s. The rest of the semantics (monotonic
+        // floor, growth arming) are untouched by the cadence change.
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage3))
+        XCTAssertEqual(d.ingest(310_000), .accepted)   // seeded checkpoint
+        XCTAssertEqual(d.ingest(320_000), .accepted)   // growth arms, tick 1
+        XCTAssertEqual(d.ingest(320_000), .accepted)   // tick 2
+        XCTAssertEqual(d.ingest(320_000), .plateau)    // tick 3 — settled
+    }
+
+    func testStage2DeathEvidenceStaysCountAndClockBasedAtAnyCadence() {
+        // The re-entry classification never counted ticks: runtime is wall
+        // clock and growth is SECTORS since the first accepted capture, so
+        // the 20 s cadence only means the last pre-death capture can be up to
+        // ~20 s stale — noise against the >8 min / >+10k-sector thresholds.
+        XCTAssertEqual(Stage2DeathEvidence.finalizeMinRuntime, 8 * 60)
+        XCTAssertEqual(Stage2DeathEvidence.finalizeMinGrowth, 10_000)
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage2))
+        _ = d.ingest(388_979)                          // re-seeded checkpoint
+        _ = d.ingest(401_690)                          // one slow tick of real Setup work
+        let evidence = Stage2DeathEvidence(runtime: 60,
+                                           captureGrowth: d.growthSinceFirstAccepted)
+        XCTAssertTrue(evidence.indicatesFinalizeRestart,
+                      "growth evidence must survive arriving in fewer, larger ticks")
     }
 
     // MARK: - Stage/retry state machine
@@ -293,17 +344,47 @@ final class InstallOrchestratorTests: XCTestCase {
 
     // MARK: - Injected JS builders
 
-    func testCaptureLoopJSCarriesTheLoadBearingPieces() {
+    func testCaptureLoopJSStage1CarriesTheLoadBearingPieces() {
         let js = InstallJS.captureLoop(
-            targetBase: "pocketdos://app/lib/ABC/target-drive/drive", floor: 123_456)
+            targetBase: "pocketdos://app/lib/ABC/target-drive/drive", floor: 123_456,
+            tickSeconds: CaptureCadence.tickSeconds(for: .stage1),
+            liveReseed: CaptureCadence.liveReseed(for: .stage1))
         XCTAssertTrue(js.contains("\"pocketdos://app/lib/ABC/target-drive/drive\""),
                       "the target base must be matched EXACTLY (two drives are mounted)")
         XCTAssertTrue(js.contains("var last = 123456;"),
                       "the monotonic floor must survive page reloads via Swift")
         XCTAssertTrue(js.contains("ci.persist(true)"))
-        XCTAssertTrue(js.contains("pdosReseed"), "the LIVE re-seed is what makes reboots survive")
+        XCTAssertTrue(js.contains("pdosReseed"),
+                      "stage 1's LIVE re-seed is what makes its warm reboots survive")
         XCTAssertTrue(js.contains("[pdos-install] captured "))
-        XCTAssertTrue(js.contains("4500"), "the proven 4.5s capture cadence")
+        XCTAssertTrue(js.contains("[pdos-install] tick-ms "),
+                      "every persist logs its serialize cost (device OOM forensics)")
+        XCTAssertTrue(js.contains("setInterval(tick, 4500)"),
+                      "stage 1 keeps the proven 4.5s capture cadence")
+    }
+
+    func testCaptureLoopJSStages2And3ArePersistOnlyAtTheSlowTick() {
+        // THE device OOM fix: with stage 2's ~150 MB overlay, persist + live
+        // IndexedDB re-seed every 4.5 s ≈ 300+ MB of transient allocation per
+        // tick — Jetsam killed WebContent ~50-60 s after ci-ready on all
+        // three recovery boots. Stages 2/3 persist every 20 s and hold
+        // __lastGood in page memory only; boot boundaries re-seed the pulled
+        // checkpoint explicitly (reseedAndGo), so nothing is lost.
+        for stage in [InstallFlow.Stage.stage2, .stage3] {
+            let js = InstallJS.captureLoop(
+                targetBase: "pocketdos://app/lib/ABC/target-drive/drive", floor: 388_915,
+                tickSeconds: CaptureCadence.tickSeconds(for: stage),
+                liveReseed: CaptureCadence.liveReseed(for: stage))
+            XCTAssertFalse(js.contains("pdosReseed"),
+                           "\(stage): NO per-tick re-seed — that copy is what OOM'd the phone")
+            XCTAssertTrue(js.contains("window.__lastGood = bytes"),
+                          "\(stage): the in-page checkpoint must still feed the pull channel")
+            XCTAssertTrue(js.contains("var last = 388915;"))
+            XCTAssertTrue(js.contains("ci.persist(true)"))
+            XCTAssertTrue(js.contains("[pdos-install] captured "))
+            XCTAssertTrue(js.contains("[pdos-install] tick-ms "))
+            XCTAssertTrue(js.contains("setInterval(tick, 20000)"), "\(stage): 20s tick")
+        }
     }
 
     func testReseedAndGoJSFetchesCheckpointThenReleasesTheBoot() throws {
@@ -348,7 +429,9 @@ final class InstallOrchestratorTests: XCTestCase {
         ])
         XCTAssertEqual(InstallJS.pressEnter, "window.ci && window.ci.simulateKeyPress(257)")
         XCTAssertEqual(InstallJS.pressAltA, "window.ci && window.ci.simulateKeyPress(342, 65)")
-        XCTAssertEqual(SetupScript.leadInSeconds, 60)
+        XCTAssertEqual(SetupScript.leadInSeconds, 30,
+                       "halved from 60: cycles are idempotent so early keys are safe, "
+                       + "and the run reaches evidence-producing work sooner")
         XCTAssertEqual(SetupScript.maxCycles, 12, "hard cap — the loop must not run forever")
     }
 
@@ -369,7 +452,8 @@ final class InstallOrchestratorTests: XCTestCase {
             .press(js: InstallJS.pressAltA), .wait(seconds: 1.5),
             .press(js: InstallJS.pressEnter),
         ])
-        XCTAssertEqual(DesktopProbe.settleTicks, 3)
+        XCTAssertEqual(DesktopProbe.settleTicks, 2,
+                       "≈ 40 s of settle at stage 3's 20 s capture cadence")
         XCTAssertEqual(DesktopProbe.maxProbes, 3)
     }
 

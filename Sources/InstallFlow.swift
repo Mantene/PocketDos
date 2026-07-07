@@ -15,9 +15,12 @@ import Foundation
 //   stage 3  recovery boot C: (hands-off) → desktop → final capture, with
 //            every write plateau PROBED before it is trusted as the desktop
 // with the install state carried between stages as the target sockdrive's
-// write-overlay blob, captured in-page via `ci.persist(true)` every 4.5 s and
-// re-seeded LIVE into IndexedDB (that re-seed is what lets warm reboots and
-// page reloads continue instead of restarting).
+// write-overlay blob, captured in-page via `ci.persist(true)` on a per-stage
+// cadence (CaptureCadence). Stage 1 re-seeds every accepted capture LIVE into
+// IndexedDB (that re-seed is what lets its warm reboots and page reloads
+// continue instead of restarting); stages 2/3 persist-only every 20 s — the
+// second device run OOM'd serializing AND copying a ~150 MB overlay into
+// IndexedDB every 4.5 s (≈300+ MB of transient allocation per tick).
 
 // MARK: - Breadcrumb parsing
 
@@ -252,6 +255,38 @@ struct InstallFlow: Equatable {
     }
 }
 
+// MARK: - Capture transport cadence (per stage — device OOM fix)
+
+/// Per-stage parameters for the injected capture loop. The second device run
+/// proved the STATE MACHINE right (three clean stage-2 recovery boots) and
+/// the TRANSPORT fatal: every 4.5 s tick ran `ci.persist(true)` AND a live
+/// IndexedDB re-seed, so with stage 2's ~150 MB overlay each tick transiently
+/// allocated 300+ MB on top of the overlay map + wasm heap — iOS Jetsam
+/// killed WebContent ~50-60 s after ci-ready, every boot. Only the transport
+/// gets cheaper here; growth detection, plateau, and lastGood recovery
+/// semantics are unchanged.
+///  - Stage 1 keeps 4.5 s + live re-seed: its overlays start small, and the
+///    re-seed is what lets phase-1's in-page warm reboot continue.
+///  - Stages 2/3 tick every 20 s with NO per-tick re-seed (persist only,
+///    `__lastGood` held in page memory): live re-seed only serves in-page
+///    guest warm reboots, stage-2/3's only reboot (the finalize restart)
+///    kills the process anyway, and every boot boundary explicitly re-seeds
+///    the pulled checkpoint (reseedAndGo).
+///  - Plateau stays ~a minute of settled writes in wall-clock terms:
+///    4 equal ticks at 4.5 s for stage 1 (the proven runbook rule), 3 equal
+///    ticks ≈ 60 s at the 20 s cadence.
+enum CaptureCadence {
+    static func tickSeconds(for stage: InstallFlow.Stage) -> TimeInterval {
+        stage == .stage1 ? 4.5 : 20
+    }
+    static func liveReseed(for stage: InstallFlow.Stage) -> Bool {
+        stage == .stage1
+    }
+    static func plateauTicks(for stage: InstallFlow.Stage) -> Int {
+        stage == .stage1 ? 4 : 3
+    }
+}
+
 // MARK: - Stage-2 keystroke loop & stage-3 desktop probe (pure halves)
 
 /// One native-driven keystroke step: evaluate `js` in the page, or idle.
@@ -273,8 +308,10 @@ enum ScriptStep: Equatable {
 /// copy/hardware work — never on elapsed time.
 enum SetupScript {
     /// Idle lead-in after the go release: the C: boot plus Setup's first
-    /// wizard paint.
-    static let leadInSeconds: TimeInterval = 60
+    /// wizard paint. Kept short — the cycle loop is idempotent, so keys that
+    /// land before Setup's first page are safe, and a shorter lead-in gets
+    /// the evidence (captures) flowing sooner.
+    static let leadInSeconds: TimeInterval = 30
     /// Hard cap on cycles per stage-2 boot (each cycle is breadcrumbed:
     /// "[pdos-install] script-cycle N").
     static let maxCycles = 12
@@ -307,8 +344,8 @@ enum DesktopProbe {
     /// (finalize's mouse-fix guard stays the last backstop).
     static let maxProbes = 3
     /// Accepted-capture ticks to let the poked page settle before the
-    /// flat-or-grew comparison.
-    static let settleTicks = 3
+    /// flat-or-grew comparison (≈ 40 s at stage 3's 20 s capture cadence).
+    static let settleTicks = 2
 
     /// Same key pattern as a script cycle, compressed: anything a wizard
     /// page could be waiting on, harmless on a desktop.
@@ -371,13 +408,23 @@ enum InstallJS {
     }
 
     /// The in-page capture loop, armed after each stage's ci-ready. Every
-    /// 4.5 s it runs `ci.persist(true)`, picks the TARGET drive's serialized
-    /// sector-diff (matched by exact base URL — two sockdrives are mounted in
-    /// stages 1/2, so a positional fallback could grab the CAB source), reads
-    /// the u32le record count at byte 0, and — monotonic guard — if the count
-    /// is >= the accepted floor: holds the blob as `window.__lastGood`, re-
-    /// seeds it LIVE into IndexedDB (`pdosReseed`), and logs
-    /// `[pdos-install] captured <count> <bytes>` for the native watcher.
+    /// `tickSeconds` it runs `ci.persist(true)`, picks the TARGET drive's
+    /// serialized sector-diff (matched by exact base URL — two sockdrives are
+    /// mounted in stages 1/2, so a positional fallback could grab the CAB
+    /// source), reads the u32le record count at byte 0, and — monotonic
+    /// guard — if the count is >= the accepted floor: holds the blob as
+    /// `window.__lastGood` and logs `[pdos-install] captured <count> <bytes>`
+    /// for the native watcher. Every persist also logs
+    /// `[pdos-install] tick-ms <ms>` — the serialize cost — so pulled device
+    /// logs show what each tick spent (the OOM forensic that was missing).
+    ///
+    /// `liveReseed` additionally copies each accepted blob into IndexedDB
+    /// (`pdosReseed`). Stage 1 wants that: the re-seed is what lets phase-1's
+    /// in-page warm reboot resume, and stage-1 overlays start small. Stages
+    /// 2/3 run persist-only (CaptureCadence): re-seeding a ~150 MB overlay on
+    /// every 4.5 s tick is what Jetsam-killed WebContent on device, their only
+    /// reboot (the finalize restart) kills the process anyway, and every boot
+    /// boundary explicitly re-seeds the pulled checkpoint (reseedAndGo).
     ///
     /// `floor` seeds the monotonic guard ACROSS page reloads: the page-local
     /// floor dies with the page, so a partial persist on the first tick of a
@@ -388,8 +435,13 @@ enum InstallJS {
     /// pdosPersistBegin/Chunk/End transport shape: begin pins the CURRENT
     /// `__lastGood` reference (persist passes replace, never mutate, so the
     /// pinned blob stays coherent while ticks continue), chunks stream base64.
-    static func captureLoop(targetBase: String, floor: Int) -> String {
-        """
+    static func captureLoop(targetBase: String, floor: Int,
+                            tickSeconds: TimeInterval, liveReseed: Bool) -> String {
+        let tickMs = Int((tickSeconds * 1000).rounded())
+        let reseedLine = liveReseed
+            ? "await window.pdosReseed(TARGET, bytes);"
+            : "/* no per-tick re-seed (device OOM fix): boot boundaries re-seed the pulled checkpoint */"
+        return """
         (function () {
           if (window.__pdosCapTimer) { clearInterval(window.__pdosCapTimer); window.__pdosCapTimer = null; }
           window.__pdosCapStop = false;
@@ -420,12 +472,14 @@ enum InstallJS {
             busy = true;
             try {
               if (!window.ci || typeof window.ci.persist !== "function") return;
+              var t0 = performance.now();
               var out = await Promise.race([
                 window.ci.persist(true),
                 new Promise(function (resolve, reject) {
                   setTimeout(function () { reject(new Error("persist timeout")); }, 60000);
                 })
               ]);
+              console.log("[pdos-install] tick-ms " + Math.round(performance.now() - t0));
               var bytes = null;
               if (out && out.drives) {
                 for (var i = 0; i < out.drives.length; i++) {
@@ -440,7 +494,7 @@ enum InstallJS {
               if (count >= last) {
                 last = count;
                 window.__lastGood = bytes;
-                await window.pdosReseed(TARGET, bytes);
+                \(reseedLine)
                 console.log("[pdos-install] captured " + count + " " + bytes.length);
               } else {
                 console.log("[pdos-install] capture-regressed " + count + " " + last);
@@ -449,7 +503,7 @@ enum InstallJS {
               console.log("[pdos-install] capture-error " + (e && e.message ? e.message : e));
             } finally { busy = false; }
           }
-          window.__pdosCapTimer = setInterval(tick, 4500);
+          window.__pdosCapTimer = setInterval(tick, \(tickMs));
         })();
         """
     }

@@ -68,7 +68,9 @@ final class InstallOrchestrator: ObservableObject {
 
     // MARK: - Tunables (runbook timings, generous)
 
-    static let captureTickSeconds = 4.5          // in-page persist cadence
+    // In-page persist cadence + re-seed policy are PER STAGE: CaptureCadence
+    // (InstallFlow.swift) — stage 1 at the proven 4.5 s with live re-seed,
+    // stages 2/3 at 20 s persist-only (the device OOM fix).
     static let bootTimeout: TimeInterval = 90    // load → ci-ready / waiting-for-go
     static let captureSilenceLimit: TimeInterval = 300   // persist silence = death
     /// Panic/crash events arriving this soon after a load() are the OLD page's
@@ -85,9 +87,9 @@ final class InstallOrchestrator: ObservableObject {
         }
     }
     /// How long a stage-3 desktop probe waits for its settle ticks before
-    /// comparing counts anyway (nominal is settleTicks × 4.5 s; the in-page
-    /// persist can stall far longer under load).
-    static let probeSettleTimeout: TimeInterval = 45
+    /// comparing counts anyway (nominal is settleTicks × stage 3's 20 s
+    /// cadence = 40 s; the in-page persist can stall far longer under load).
+    static let probeSettleTimeout: TimeInterval = 90
     // Stage 2's keystroke cycles and stage 3's desktop probe are pure data:
     // SetupScript / DesktopProbe in InstallFlow.swift.
 
@@ -390,7 +392,7 @@ final class InstallOrchestrator: ObservableObject {
                     continue
                 }
                 flow.bootSucceeded()
-                armCaptureLoop(shared: shared, floor: captureFloor(for: stage, folder: folder))
+                armCaptureLoop(stage, shared: shared, floor: captureFloor(for: stage, folder: folder))
                 if stage == .stage2 {
                     let diedDuringScript = try await runSetupScript(shared: shared)
                     if diedDuringScript {
@@ -419,8 +421,9 @@ final class InstallOrchestrator: ObservableObject {
                 case .died:
                     // Best-effort checkpoint refresh: after a [panic] the page
                     // usually still answers (only the WASM died), and its
-                    // __lastGood is ≤4.5 s old. After a process kill this
-                    // throws and the previous checkpoint stands.
+                    // __lastGood is at most one capture tick old. After a
+                    // process kill this throws and the previous checkpoint
+                    // (the last successful pull into stage.bin) stands.
                     try? await pullCapture(shared: shared, to: stageBinFileURL(folder))
                     next = flow.died(
                         stage2Evidence: stage == .stage2 ? stage2DeathEvidence() : nil)
@@ -481,12 +484,17 @@ final class InstallOrchestrator: ObservableObject {
         eventQueue.removeAll()   // stale events die with the page they came from
     }
 
-    private func armCaptureLoop(shared: SharedEmulator, floor: Int) {
-        stageDetector = CapturePlateauDetector()
+    /// Injects the stage's capture loop and re-arms the plateau detector at
+    /// the stage's cadence (CaptureCadence: stage 1 = 4.5 s + live re-seed,
+    /// stages 2/3 = 20 s persist-only with plateau at 3 equal ticks ≈ 60 s).
+    private func armCaptureLoop(_ stage: InstallFlow.Stage, shared: SharedEmulator, floor: Int) {
+        stageDetector = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: stage))
         plateauSeen = false
         lastCaptureAt = Date()
         shared.webView.evaluateJavaScript(
-            InstallJS.captureLoop(targetBase: targetBase, floor: floor),
+            InstallJS.captureLoop(targetBase: targetBase, floor: floor,
+                                  tickSeconds: CaptureCadence.tickSeconds(for: stage),
+                                  liveReseed: CaptureCadence.liveReseed(for: stage)),
             completionHandler: nil)
     }
 
@@ -567,8 +575,9 @@ final class InstallOrchestrator: ObservableObject {
         return deathSeen
     }
 
-    /// Waits for `ticks` accepted captures (nominally ticks × 4.5 s), bounded
-    /// by `probeSettleTimeout` in case the in-page persist stalls. True =
+    /// Waits for `ticks` accepted captures (nominally ticks × the stage's
+    /// capture cadence — 20 s where this is used, stage 3), bounded by
+    /// `probeSettleTimeout` in case the in-page persist stalls. True =
     /// death seen.
     private func awaitCaptureTicks(_ ticks: Int) async throws -> Bool {
         let deadline = Date().addingTimeInterval(Self.probeSettleTimeout)
@@ -642,7 +651,8 @@ final class InstallOrchestrator: ObservableObject {
                 // watch WITHOUT the growth requirement: the page's write
                 // burst may finish inside the settle wait we just spent, and
                 // the next plateau is probed (or budget-trusted) anyway.
-                stageDetector = CapturePlateauDetector(requireGrowth: false)
+                stageDetector = CapturePlateauDetector(
+                    plateauTicks: CaptureCadence.plateauTicks(for: .stage3), requireGrowth: false)
                 plateauSeen = false
             }
         }
