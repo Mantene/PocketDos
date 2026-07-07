@@ -102,9 +102,16 @@ enum InstallBreadcrumb: Equatable {
 ///    would regress the held state). Rejections do NOT break a plateau run.
 ///  - GROWTH ARMING (`requireGrowth`): the plateau only fires after the count
 ///    has strictly INCREASED at least once within this detector's lifetime.
-///    Stages 2/3 (and stage-1 retries) boot with the count already above the
-///    minimum — without arming, the first four idle boot ticks would read as
-///    "installation settled" before Setup wrote anything.
+///    Stage 2 (and stage-1 retries) boot with the count already above the
+///    minimum — without arming, the first idle boot ticks would read as
+///    "installation settled" before Setup wrote anything, and neither stage
+///    has a later gate. Stage 3 arms WITHOUT it (device run #6): its final
+///    boot can land on an already-CONVERGED system whose idle-desktop writes
+///    (swap, registry flushes) rewrite EXISTING sectors — the unique-sector
+///    count stays flat at the re-seeded floor forever, so a growth-armed
+///    watch never fires and the stage idles to its deadline. There the
+///    desktop PROBE is the gate against a premature plateau, not growth
+///    (CaptureCadence.requireGrowth is the per-stage rule).
 struct CapturePlateauDetector: Equatable {
     enum Verdict: Equatable {
         case rejected   // below the monotonic floor — discard
@@ -450,6 +457,21 @@ enum CaptureCadence {
     }
     static func plateauTicks(for stage: InstallFlow.Stage) -> Int {
         3
+    }
+    /// Growth arming for the stage's plateau watch (CapturePlateauDetector's
+    /// `requireGrowth`). Stages 1/2 keep it: their idle boot ticks echo the
+    /// re-seeded checkpoint's count, they have no later gate, and a
+    /// growth-free watch would read "settled" before Setup resumed. Stage 3
+    /// must NOT require growth (device run #6): its final boot can land on an
+    /// already-converged system — idle-desktop writes rewrite existing
+    /// sectors, so the count sits flat AT the floor and a growth-armed watch
+    /// deadlocks until the stage deadline. Flat-at-floor ticks are `captured`
+    /// (the page's monotonic guard accepts count >= floor; regression is
+    /// strictly below), so a zero-growth boot reaches plateau → probe on
+    /// equal counts alone, and the PROBE — not growth — is what rejects a
+    /// waiting wizard page (its keys make a live page write and GROW).
+    static func requireGrowth(for stage: InstallFlow.Stage) -> Bool {
+        stage != .stage3
     }
 }
 

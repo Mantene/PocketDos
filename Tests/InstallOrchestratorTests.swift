@@ -84,9 +84,11 @@ final class InstallOrchestratorTests: XCTestCase {
     }
 
     func testNoPlateauWithoutGrowthWhenSeededAboveMinimum() {
-        // A stage 2/3 boot starts with the count already huge (the seeded
-        // write store). Without the growth arming, the first four idle boot
-        // ticks would read as "install finished".
+        // A stage-2 (or stage-1 retry) boot starts with the count already
+        // huge (the seeded write store). Without the growth arming, the
+        // first four idle boot ticks would read as "install finished".
+        // (Stage 3 deliberately DROPS this arming — run #6, tested below —
+        // because its desktop probe is the gate there.)
         var d = CapturePlateauDetector()
         for _ in 0..<8 {
             XCTAssertEqual(d.ingest(800_000), .accepted)
@@ -163,6 +165,13 @@ final class InstallOrchestratorTests: XCTestCase {
         XCTAssertNil(CaptureCadence.switchCount(for: .stage3))
         XCTAssertEqual(CaptureCadence.plateauTicks(for: .stage3), 3)
 
+        // Growth arming rides the same table (device run #6): stages 1/2
+        // keep it, stage 3's watches fire on flat-at-floor ticks and let
+        // the desktop probe gate the plateau instead.
+        XCTAssertTrue(CaptureCadence.requireGrowth(for: .stage1))
+        XCTAssertTrue(CaptureCadence.requireGrowth(for: .stage2))
+        XCTAssertFalse(CaptureCadence.requireGrowth(for: .stage3))
+
         // A plateau can only FIRE above the 300k minimum, which is past the
         // 200k switch — so stage 1's plateau-relevant cadence is the slow
         // one and its plateau rule is 3 equal ticks ≈ 60 s, like stages 2/3
@@ -178,8 +187,10 @@ final class InstallOrchestratorTests: XCTestCase {
         // Stages 2/3 arm the detector with plateauTicks: 3 — at the 20 s tick
         // that is ≈ 60 s of settled writes, the same wall-clock confidence the
         // 4-tick rule gave at 4.5 s. The rest of the semantics (monotonic
-        // floor, growth arming) are untouched by the cadence change.
-        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage3))
+        // floor, stage 2's growth arming — stage 3's watch is growth-free
+        // since run #6, tested in its own section) are untouched by the
+        // cadence change.
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage2))
         XCTAssertEqual(d.ingest(310_000), .accepted)   // seeded checkpoint
         XCTAssertEqual(d.ingest(320_000), .accepted)   // growth arms, tick 1
         XCTAssertEqual(d.ingest(320_000), .accepted)   // tick 2
@@ -523,7 +534,8 @@ final class InstallOrchestratorTests: XCTestCase {
         // The plateau path stays for the fresh-store case (e.g. the reboot
         // lands right after a recovery boot's re-seed): equal ticks above
         // 300k still fire it at stage 1's slow-cadence rule…
-        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage1))
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage1),
+                                       requireGrowth: CaptureCadence.requireGrowth(for: .stage1))
         XCTAssertEqual(d.ingest(344_979), .accepted)   // recovery checkpoint
         XCTAssertEqual(d.ingest(388_979), .accepted)   // copy finishes (grew → armed)
         XCTAssertEqual(d.ingest(388_979), .accepted)   // parked pass-2 writes nothing
@@ -818,6 +830,70 @@ final class InstallOrchestratorTests: XCTestCase {
                       "flat probe = desktop confirmed = done")
         XCTAssertFalse(DesktopProbe.isFlat(baseline: 401_690, latest: 401_691),
                        "ANY growth = the probe advanced a live page = keep watching")
+    }
+
+    // MARK: - Stage-3 growth-free plateau watch (device fix, run #6)
+
+    func testStage3PlateauWatchesArmWithoutGrowthStages1And2KeepArming() {
+        // Run #6: the final stage-3 boot landed on an already-CONVERGED
+        // system (real desktop, Welcome tour up) and sat 20+ minutes to the
+        // stage deadline. Idle-desktop writes (swap, registry flushes)
+        // rewrite EXISTING sectors, so the unique-sector count never grew —
+        // the growth-armed initial watch never fired and the desktop probe
+        // never got to run. The probe is stage 3's real gate against a
+        // false desktop (its keys make a waiting page write and GROW), so
+        // growth arming added nothing there but the deadlock: every stage-3
+        // watch — the initial arm included, not just the post-probe
+        // re-arms — is now growth-free. Stages 1/2 keep the arming: their
+        // idle boot ticks echo the re-seeded checkpoint and they have no
+        // probe behind the plateau.
+        XCTAssertFalse(CaptureCadence.requireGrowth(for: .stage3),
+                       "stage 3's initial watch must match the post-probe re-arms")
+        XCTAssertTrue(CaptureCadence.requireGrowth(for: .stage1))
+        XCTAssertTrue(CaptureCadence.requireGrowth(for: .stage2))
+    }
+
+    func testStage3FlatAtFloorFromTickOneReachesThePlateau() {
+        // The run-#6 deadlock shape, fixed: the boot re-seeds its checkpoint,
+        // the capture loop floors at its count, and every persist reports
+        // that SAME count (equal-at-floor is `captured` — the page's
+        // monotonic guard accepts count >= floor; `capture-regressed` is
+        // strictly below). Armed exactly as armCaptureLoop arms stage 3's
+        // initial watch, three flat-at-floor ticks ARE the plateau — zero
+        // growth ever required — and the desktop probe then decides.
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage3),
+                                       requireGrowth: CaptureCadence.requireGrowth(for: .stage3))
+        XCTAssertEqual(d.ingest(407_113), .accepted, "tick 1 = the floor echoed back")
+        XCTAssertEqual(d.ingest(407_113), .accepted, "tick 2")
+        XCTAssertEqual(d.ingest(407_113), .plateau, "tick 3 — plateau with no growth seen")
+    }
+
+    func testStage3EqualAtFloorIsAPlateauTickOnlyStrictlyBelowRejects() {
+        // Equality vs regression stays STRICT: a count EQUAL to the floor
+        // counts toward the plateau run, only strictly-below is a rejection
+        // — and a rejection does not break the flat run (the same noise
+        // rule the growth-armed detector always had).
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage3),
+                                       requireGrowth: CaptureCadence.requireGrowth(for: .stage3))
+        XCTAssertEqual(d.ingest(407_113), .accepted)
+        XCTAssertEqual(d.ingest(407_112), .rejected, "below the floor = regression, never a flat tick")
+        XCTAssertEqual(d.ingest(407_113), .accepted, "the run survives the reject: flat tick 2")
+        XCTAssertEqual(d.ingest(407_113), .plateau, "flat tick 3")
+    }
+
+    func testStage2InitialWatchStillRequiresGrowthBeforePlateau() {
+        // Stage 2 is UNCHANGED by the run-#6 fix — its exits are death /
+        // boundary / script-growth, and its idle boot ticks (the re-seeded
+        // checkpoint echoed back while Setup repaints its wizard) must
+        // never read as settled writes.
+        var d = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: .stage2),
+                                       requireGrowth: CaptureCadence.requireGrowth(for: .stage2))
+        for _ in 0..<10 {
+            XCTAssertEqual(d.ingest(388_979), .accepted, "flat-at-floor never plateaus in stage 2")
+        }
+        XCTAssertEqual(d.ingest(401_690), .accepted)   // real Setup work arms it, tick 1
+        XCTAssertEqual(d.ingest(401_690), .accepted)   // tick 2
+        XCTAssertEqual(d.ingest(401_690), .plateau)    // tick 3
     }
 
     // MARK: - Overlay header (capture-loop floor source)

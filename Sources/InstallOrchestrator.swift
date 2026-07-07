@@ -62,6 +62,16 @@ struct InstallError: Error {
 /// faster. Process kills skip it naturally: the page is gone, the evaluate
 /// throws, try? falls through to the pull's own failure fallback.
 ///
+/// Device run #6 fix: stage 3's final boot REACHED the real desktop and then
+/// sat 20+ minutes to the stage deadline — idle-desktop writes rewrite
+/// EXISTING sectors, so the unique-sector count never grew and the
+/// growth-armed initial plateau watch never armed, never fired, and never
+/// let the desktop probe run. Stage 3's plateau watches (the initial arm
+/// included) are now growth-free (CaptureCadence.requireGrowth): three
+/// flat-at-floor ticks ARE the plateau, and the probe alone decides desktop
+/// (flat) vs waiting page (grew). Stages 1/2 keep the growth arming — they
+/// have no probe, and their idle boot ticks must not read as settled.
+///
 /// It observes the install page through the EXISTING console bridge — via the
 /// additive `EmulatorController.onConsoleLine` hook — and through
 /// `EmulatorController.loadError` (the Bridge reports engine panics and
@@ -701,11 +711,18 @@ final class InstallOrchestrator: ObservableObject {
     /// live re-seed until 200k sectors then an in-page switch to 20 s
     /// persist-only; stages 2/3 = 20 s persist-only always; plateau at
     /// 3 equal ticks ≈ 60 s at the slow cadence, the only one plateaus can
-    /// fire at — their 300k minimum is past stage 1's switch).
+    /// fire at — their 300k minimum is past stage 1's switch). Growth arming
+    /// is per stage too (CaptureCadence.requireGrowth — device run #6):
+    /// stage 3's INITIAL watch must fire on flat-at-floor ticks, because a
+    /// boot landing on an already-converged desktop never grows the count —
+    /// the desktop probe, not growth, gates its plateaus. Stages 1/2 keep
+    /// the arming (idle boot ticks echoing the re-seeded checkpoint must
+    /// not read as settled).
     private func armCaptureLoop(_ stage: InstallFlow.Stage, shared: SharedEmulator, floor: Int) {
         currentStage = stage
         currentCaptureFloor = floor   // the final flush guards on the SAME floor
-        stageDetector = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: stage))
+        stageDetector = CapturePlateauDetector(plateauTicks: CaptureCadence.plateauTicks(for: stage),
+                                               requireGrowth: CaptureCadence.requireGrowth(for: stage))
         plateauSeen = false
         lastCaptureAt = Date()
         // Mirror the loop's baked `live` flag: a boot floored past the
@@ -872,10 +889,17 @@ final class InstallOrchestrator: ObservableObject {
     /// grew → a wizard page ate the keys and advanced → resume watching for
     /// the next plateau on the SAME stage deadline. At most
     /// `DesktopProbe.maxProbes` probes per boot; after that the next plateau
-    /// is accepted (finalize's mouse-fix guard is the last backstop). The
-    /// deadline is the caller's persisted stage clock — a reboot boundary
-    /// (or a probe interrupted by one) surfaces as .guestRebooted and the
-    /// reloaded boot re-enters here with a fresh probe budget.
+    /// is accepted (finalize's mouse-fix guard is the last backstop). Every
+    /// stage-3 plateau watch — the INITIAL arm included — runs growth-free
+    /// (device run #6: the final boot landed on an already-converged desktop
+    /// whose idle writes rewrite existing sectors, so the count never grew,
+    /// the growth-armed watch never fired, and the stage idled to its
+    /// deadline with the probe never consulted; the probe is the gate
+    /// against a false desktop, growth arming added nothing but the
+    /// deadlock). The deadline is the caller's persisted stage clock — a
+    /// reboot boundary (or a probe interrupted by one) surfaces as
+    /// .guestRebooted and the reloaded boot re-enters here with a fresh
+    /// probe budget.
     private func watchStage3ToDesktop(shared: SharedEmulator, until deadline: Date) async throws -> StageOutcome {
         var probes = 0
         while true {
@@ -896,11 +920,13 @@ final class InstallOrchestrator: ObservableObject {
                 }
                 emitBreadcrumb("desktop-probe grew", shared: shared)
                 // The keys advanced a live wizard page. Re-arm the plateau
-                // watch WITHOUT the growth requirement: the page's write
-                // burst may finish inside the settle wait we just spent, and
-                // the next plateau is probed (or budget-trusted) anyway.
+                // watch — growth-free like every stage-3 watch (run #6):
+                // the page's write burst may finish inside the settle wait
+                // we just spent, and the next plateau is probed (or
+                // budget-trusted) anyway.
                 stageDetector = CapturePlateauDetector(
-                    plateauTicks: CaptureCadence.plateauTicks(for: .stage3), requireGrowth: false)
+                    plateauTicks: CaptureCadence.plateauTicks(for: .stage3),
+                    requireGrowth: CaptureCadence.requireGrowth(for: .stage3))
                 plateauSeen = false
             }
         }
