@@ -166,7 +166,9 @@ struct LibraryView: View {
                 case .about:
                     AboutView()
                 case .installWizard:
-                    InstallWizardView { sheet = nil }
+                    // The wizard drives the SAME shared WebView/process the games
+                    // use (the app never creates a second WebContent process).
+                    InstallWizardView(store: store, shared: sharedEmulator) { sheet = nil }
                 }
             }
             .fileImporter(isPresented: $importing,

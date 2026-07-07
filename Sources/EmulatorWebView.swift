@@ -62,6 +62,10 @@ struct EmulatorWebView: UIViewRepresentable {
             let text = "\(message.body)"
             print("[web] \(text)")
 
+            // Additive tap for the install orchestrator's breadcrumb parsing —
+            // everything below continues exactly as before.
+            emulator?.onConsoleLine?(text)
+
             // The web layer logs this when it overlays a saved session at launch;
             // surface it natively so the user gets visible "restored" confirmation.
             if text.contains("[pdos-restore] restoring") {

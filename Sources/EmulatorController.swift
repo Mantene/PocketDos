@@ -30,6 +30,11 @@ final class EmulatorController: ObservableObject {
     /// MEMFS at restore → OOM; a sockdrive re-seed streams into IndexedDB instead, so the
     /// doubling never happens. Set per game at launch.
     var isSockdrivePersist = false
+    /// ADDITIVE tap on the web layer's console stream: the Bridge hands every
+    /// console line here (after its own handling, which is untouched). The
+    /// install wizard's orchestrator uses it to parse `[pdos-install]`
+    /// breadcrumbs; nil (the default) costs nothing.
+    var onConsoleLine: ((String) -> Void)?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     /// A persist is in flight; further requests coalesce onto it (their completions
     /// run when it finishes) so overlapping triggers — periodic autosave, pause,

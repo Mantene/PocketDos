@@ -11,7 +11,14 @@ import UniformTypeIdentifiers
 /// The only install assets we ship are license-clean: a blank formatted FAT32 disk
 /// template (zeros + FAT structures) and DOSBox-X's GPL mouse-integration driver.
 struct InstallWizardView: View {
+    let store: GameStore
+    let shared: SharedEmulator
     var onDone: () -> Void
+
+    /// The engine behind the Install button: drives the shared WebView through
+    /// media build → the three install stages → mouse fix → library game.
+    @StateObject private var orchestrator = InstallOrchestrator()
+    @State private var installing = false
 
     // The picked ISO. We keep a security-scoped BOOKMARK (not a copy): a Win98 CD
     // image is ~650 MB, and the install only needs to read \WIN98 out of it once,
@@ -87,17 +94,14 @@ struct InstallWizardView: View {
 
                 Section {
                     Button {
-                        // Increment 1 stops here by design: requirements captured +
-                        // validated. The install engine (media build → unattended
-                        // Setup → mouse driver → final machine) is the next build.
-                        onDone()
+                        startInstall()
                     } label: {
                         Label("Install Windows 98", systemImage: "arrow.down.circle")
                             .frame(maxWidth: .infinity)
                     }
-                    .disabled(true)
+                    .disabled(!canInstall)
                 } footer: {
-                    Text("Installation is coming in the next build. Your selections above already validate, so this wizard will pick up right here.")
+                    Text("A full install runs unattended for roughly 30-60 minutes. Keep PocketDOS open and on this screen; the display stays awake by itself.")
                 }
             }
             .navigationTitle("Install Windows 98")
@@ -112,7 +116,31 @@ struct InstallWizardView: View {
                           allowsMultipleSelection: false) { result in
                 handlePickedISO(result)
             }
+            .fullScreenCover(isPresented: $installing) {
+                InstallProgressView(orchestrator: orchestrator, shared: shared,
+                                    onFinished: {
+                                        installing = false
+                                        onDone()   // back to the library — the new game is in it
+                                    },
+                                    onClosed: {
+                                        installing = false   // back to this form (retry / bail)
+                                    })
+            }
         }
+    }
+
+    // MARK: - Install launch
+
+    /// Both requirements captured and valid → the engine can start.
+    private var canInstall: Bool { isoBookmark != nil && keyValid }
+
+    private func startInstall() {
+        guard let bookmark = isoBookmark, keyValid else { return }
+        // The key rides the in-memory wizard state into InstallMediaBuilder
+        // (MSBATCH.INF on the generated D: source) and exists nowhere else.
+        orchestrator.start(isoBookmark: bookmark, productKey: productKey,
+                           shared: shared, store: store)
+        installing = true
     }
 
     // MARK: - ISO handling
