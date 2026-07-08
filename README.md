@@ -327,6 +327,7 @@ are entitled to your opinions and I respect them. I don't know if AI is a
 force for good or ill in this arena. Time will tell.
 
 Built on the backs of:
-[JS-DOS](https://github.com/caiiiycuk/js-dos)
-[DOSBox-X](https://github.com/joncampbell123/dosbox-x)
-[sockdrive v2](https://github.com/caiiiycuk/sockdrive)
+| ----------- |
+|[JS-DOS](https://github.com/caiiiycuk/js-dos)|
+|[DOSBox-X](https://github.com/joncampbell123/dosbox-x)|
+|[sockdrive v2](https://github.com/caiiiycuk/sockdrive)|
