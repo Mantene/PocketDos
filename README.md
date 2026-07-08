@@ -308,3 +308,19 @@ A separate, longer-term track — a native DOSBox Pure (libretro) core with a
 real dynarec for sideloading — lives outside this repository and is out of
 scope for V1. See [`SPEC.md`](SPEC.md) for the complete V1 specification and
 decision log.
+
+I don't want peopel to think I did all of this work myself. I am standing on 
+the backs of many many others. The original DOSBox team and the DOSBox-X team 
+for starters. More recently, Alexander Guryanov (caiiiycuk), who maintains 
+JS-DOS, without which this project would not be possible. Because JS-DOS runs 
+in a browser and because Apple does not allow JIT compilers anywhere except 
+IN WebKit, we are able to take advantage of the one area in the iOS ecosystem 
+that uses a JIT compiler thanks to Alexander Guryanov's groundwork. Much thanks.
+Finally, I am not the best programmer in the world. I am probably not one-tenth
+the programmer of anyone who worked on the foundational projects here. AI has
+been used to help program this. For a good portion of it, AI served as an
+advisor, code-reviewer, and security scanner. However, lately I have leaned on
+it a bit more and it has done some full fledged coding. Make of that what you
+will. I know some people have strong feelings about AI and how it is used. You
+are entitled to your opinions and I respect them. I don't know if AI is a 
+force for good or ill in this arena. Time will tell.
