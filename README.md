@@ -311,7 +311,8 @@ decision log.
 
 I don't want peopel to think I did all of this work myself. I am standing on 
 the backs of many many others. The original DOSBox team and the DOSBox-X team 
-for starters. More recently, Alexander Guryanov (caiiiycuk), who maintains 
+for starters. However, more recently, 
+[Alexander Guryanov (caiiiycuk)](https://github.com/caiiiycuk), who maintains 
 JS-DOS, without which this project would not be possible. Because JS-DOS runs 
 in a browser and because Apple does not allow JIT compilers anywhere except 
 IN WebKit, we are able to take advantage of the one area in the iOS ecosystem 
@@ -324,3 +325,8 @@ it a bit more and it has done some full fledged coding. Make of that what you
 will. I know some people have strong feelings about AI and how it is used. You
 are entitled to your opinions and I respect them. I don't know if AI is a 
 force for good or ill in this arena. Time will tell.
+
+Built on the backs of:
+[JS-DOS](https://github.com/caiiiycuk/js-dos)
+[DOSBox-X](https://github.com/joncampbell123/dosbox-x)
+[sockdrive v2](https://github.com/caiiiycuk/sockdrive)
