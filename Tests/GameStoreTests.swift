@@ -313,4 +313,66 @@ final class GameStoreTests: XCTestCase {
         XCTAssertEqual(updated.directionScheme, "wasd")
         XCTAssertEqual(updated.memoryMB, 64)
     }
+
+    // MARK: - failed-install cleanup (v1.1: surface orphaned folders, don't leak them)
+
+    /// A directory under Games/ that is NOT a loadable game — the residue of a failed
+    /// Win98 install (kept for forensics) or a partial import. Simulated with the
+    /// artifacts a real failed install leaves behind: a `stage.bin` recovery snapshot
+    /// plus a nested `drive/` chunk, but crucially NO `drive/sockdrive.metaj` and no
+    /// `.jsdos`/`.zip` bundle — so `loadGame` returns nil and (before this feature) the
+    /// folder was silently dropped from `reload()`, leaking disk invisibly.
+    @discardableResult
+    private func makeFailedInstallFolder(bytes: Int) throws -> URL {
+        let dir = try makeGameFolder()
+        try Data(repeating: 0xEE, count: bytes).write(to: dir.appendingPathComponent("stage.bin"))
+        let drive = dir.appendingPathComponent("drive", isDirectory: true)
+        try FileManager.default.createDirectory(at: drive, withIntermediateDirectories: true)
+        try Data(repeating: 0x11, count: 16).write(to: drive.appendingPathComponent("0.raw"))
+        return dir
+    }
+
+    func testReloadSurfacesFailedInstallAsOrphanNotGame() throws {
+        let good = try importJsdos(named: "Keen")
+        let orphan = try makeFailedInstallFolder(bytes: 2048)
+        store.reload()
+        XCTAssertEqual(store.games.map(\.id), [good.id], "the real game is still the only game")
+        XCTAssertEqual(store.orphanedInstalls.map(\.id), [orphan.lastPathComponent],
+                       "the failed-install folder is surfaced as an orphan, not silently dropped")
+    }
+
+    func testValidGamesAreNeverOrphaned() throws {
+        // The load-bearing safety guard: a real game must NEVER land in the orphan set,
+        // because cleanup deletes orphans. Both game shapes (bundle + sockdrive) qualify.
+        try importJsdos(named: "Keen")
+        let sock = tempRoot.appendingPathComponent("Win98.zip")
+        try makeZip(at: sock, entries: [("drive/sockdrive.metaj", Data("{}".utf8))])
+        try store.importGame(from: sock)
+        store.reload()
+        XCTAssertEqual(store.games.count, 2)
+        XCTAssertTrue(store.orphanedInstalls.isEmpty, "loadable games must never be classified as failed installs")
+    }
+
+    func testOrphanedInstallReportsReclaimableSize() throws {
+        _ = try makeFailedInstallFolder(bytes: 100_000)
+        store.reload()
+        let orphan = try XCTUnwrap(store.orphanedInstalls.first)
+        // Logical size sums stage.bin (100_000) + nested drive/0.raw (16), recursively.
+        XCTAssertEqual(orphan.sizeBytes, 100_016)
+        XCTAssertEqual(store.orphanedInstallsTotalBytes, 100_016)
+    }
+
+    func testCleanupOrphanedInstallsDeletesOnlyOrphans() throws {
+        let good = try importJsdos(named: "Keen")
+        let orphan = try makeFailedInstallFolder(bytes: 4096)
+        store.reload()
+        XCTAssertEqual(store.orphanedInstalls.count, 1)
+
+        store.cleanupOrphanedInstalls()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path), "the failed-install folder is deleted")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: good.folderURL.path), "the real game folder is untouched")
+        XCTAssertEqual(store.games.map(\.id), [good.id])
+        XCTAssertTrue(store.orphanedInstalls.isEmpty, "nothing left to clean up")
+    }
 }

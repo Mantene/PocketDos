@@ -31,16 +31,19 @@ struct LibraryView: View {
     @State private var sheet: LibrarySheet?
     @State private var showMT32Importer = false
     @State private var mt32Target: Game?
+    @State private var confirmingCleanup = false
 
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 16)]
 
     var body: some View {
         NavigationStack {
             Group {
-                if store.games.isEmpty {
+                if store.games.isEmpty && store.orphanedInstalls.isEmpty {
                     emptyState
                 } else {
                     ScrollView {
+                        if !store.orphanedInstalls.isEmpty { orphanBanner }
+                        if !store.games.isEmpty {
                         LazyVGrid(columns: columns, spacing: 16) {
                             ForEach(store.games) { game in
                                 Button {
@@ -101,6 +104,7 @@ struct LibraryView: View {
                             }
                         }
                         .padding()
+                        }
                     }
                 }
             }
@@ -203,6 +207,19 @@ struct LibraryView: View {
             } message: {
                 Text(importError ?? "")
             }
+            .confirmationDialog(
+                store.orphanedInstalls.count == 1
+                    ? "Delete 1 unfinished install?"
+                    : "Delete \(store.orphanedInstalls.count) unfinished installs?",
+                isPresented: $confirmingCleanup, titleVisibility: .visible) {
+                Button("Delete and Free \(ByteCountFormatter.string(fromByteCount: store.orphanedInstallsTotalBytes, countStyle: .file))",
+                       role: .destructive) {
+                    store.cleanupOrphanedInstalls()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("These are Windows installs that didn't finish. Deleting them frees space and won't touch your games.")
+            }
             // "Open in PocketDOS" from Files / share sheet → import (a second path,
             // independent of the in-app picker). onOpenURL is an event modifier, not a
             // presentation, so it doesn't add to the modifier-stacking problem above.
@@ -221,6 +238,36 @@ struct LibraryView: View {
             }
             #endif
         }
+    }
+
+    /// Reclaim affordance for failed Windows installs. They're kept on-disk for
+    /// forensics but are invisible in the game grid, so this banner is the only place
+    /// the user can see and free that space. Appears above the grid, and on its own
+    /// when the very first install failed (no games yet).
+    private var orphanBanner: some View {
+        let count = store.orphanedInstalls.count
+        let sizeText = ByteCountFormatter.string(fromByteCount: store.orphanedInstallsTotalBytes,
+                                                 countStyle: .file)
+        return HStack(spacing: 12) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .font(.title3)
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(count == 1 ? "1 unfinished install" : "\(count) unfinished installs")
+                    .font(.subheadline.weight(.semibold))
+                Text("Using \(sizeText) · your games aren't affected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button("Clean Up") { confirmingCleanup = true }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+        }
+        .padding()
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal)
+        .padding(.top, 8)
     }
 
     private var emptyState: some View {

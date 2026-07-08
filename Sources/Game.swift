@@ -271,10 +271,23 @@ func importSockdriveZip(from url: URL, into dir: URL) throws {
     }
 }
 
+/// A directory under Games/ that isn't a loadable game — the leftover of a failed
+/// Windows install (kept for forensics) or a partial import. Surfaced by
+/// `GameStore.reload()` so the user can reclaim the disk; deleted by
+/// `cleanupOrphanedInstalls()`.
+struct OrphanedInstall: Identifiable, Equatable {
+    let id: String       // the folder's name (a UUID)
+    let url: URL
+    let sizeBytes: Int64
+}
+
 /// Manages the on-disk game library under Documents/Games (Files-app visible).
 @MainActor
 final class GameStore: ObservableObject {
     @Published private(set) var games: [Game] = []
+    /// Folders under Games/ that aren't loadable games — the residue of failed installs
+    /// (see `cleanupOrphanedInstalls`). Surfaced so the user can reclaim leaked disk.
+    @Published private(set) var orphanedInstalls: [OrphanedInstall] = []
 
     static let gamesDirName = "Games"
 
@@ -323,13 +336,27 @@ final class GameStore: ObservableObject {
         let dirs = (try? fm.contentsOfDirectory(at: gamesURL,
                                                 includingPropertiesForKeys: [.isDirectoryKey])) ?? []
         var found: [Game] = []
+        var orphans: [OrphanedInstall] = []
         for dir in dirs {
             let isDir = (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            if isDir, let game = loadGame(in: dir) { found.append(game) }
+            guard isDir else { continue }
+            if let game = loadGame(in: dir) {
+                found.append(game)
+            } else {
+                // A directory that isn't a loadable game is the residue of a FAILED install
+                // (kept deliberately for forensics — see InstallOrchestrator.run) or a partial
+                // import. It's invisible to the library and silently leaks disk. Surface it so
+                // the user can reclaim the space; we never auto-delete (that would destroy the
+                // only forensic artifact of a 30-60 minute unattended run).
+                orphans.append(OrphanedInstall(id: dir.lastPathComponent, url: dir,
+                                               sizeBytes: Self.folderSize(at: dir)))
+            }
         }
         games = found.sorted {
             $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
+        // Biggest first — the point of surfacing these is reclaiming space.
+        orphanedInstalls = orphans.sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
     private func loadGame(in dir: URL) -> Game? {
@@ -501,6 +528,39 @@ final class GameStore: ObservableObject {
     func delete(_ game: Game) {
         try? FileManager.default.removeItem(at: game.folderURL)
         reload()
+    }
+
+    // MARK: - Failed-install cleanup
+
+    /// Total disk used by all surfaced failed installs (drives the "reclaim X" affordance).
+    var orphanedInstallsTotalBytes: Int64 {
+        orphanedInstalls.reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    /// Deletes every surfaced failed-install folder, then refreshes. Loadable games are
+    /// never in `orphanedInstalls`, so this cannot touch a real game.
+    func cleanupOrphanedInstalls() {
+        for orphan in orphanedInstalls {
+            try? FileManager.default.removeItem(at: orphan.url)
+        }
+        reload()
+    }
+
+    /// Recursively sums the logical byte size of a folder's regular files (metadata
+    /// enumeration only — never reads file contents). Logical size keeps the estimate
+    /// deterministic; it differs from on-disk allocated size only by block rounding.
+    private static func folderSize(at url: URL) -> Int64 {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(at: url,
+                                     includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else {
+            return 0
+        }
+        var total: Int64 = 0
+        for case let file as URL in en {
+            let vals = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            if vals?.isRegularFile == true { total += Int64(vals?.fileSize ?? 0) }
+        }
+        return total
     }
 
     /// Deletes the saved session so the game next boots fresh from its bundle.
