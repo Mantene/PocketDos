@@ -18,6 +18,16 @@
     <string>APPL</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <!-- Explicit device requirement (App Review 2026-07-14, guideline 2.3): declare only
+         arm64 — present on EVERY supported device, including the iPad review device (iPad
+         Air M3) — so this iPhone-only app installs in compatibility mode on iPad. The v1.0(2)
+         rejection was "UIRequiredDeviceCapabilities … will not install on the review device";
+         our source never set this key, so the App Store's auto-added value was the blocker.
+         Declaring arm64 explicitly satisfies Apple's remedy and is installable everywhere. -->
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
     <key>UILaunchScreen</key>
     <dict/>
     <!-- Not-for-profit, no encryption beyond OS-exempt -->
