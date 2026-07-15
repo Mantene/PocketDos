@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PocketDOS Support</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 680px; margin: 0 auto; padding: 2rem 1.25rem 4rem;
+    color: #1d1d1f; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e8e8ed; background: #161617; }
+    a { color: #6bb6ff; }
+    .card { background: #232326; border-color: #3a3a3e; }
+  }
+  h1 { font-size: 1.9rem; margin-bottom: .25rem; }
+  h2 { font-size: 1.25rem; margin-top: 2rem; }
+  .tagline { color: #86868b; margin-top: 0; }
+  .card {
+    border: 1px solid #e2e2e6; border-radius: 12px; background: #f7f7f9;
+    padding: 1rem 1.25rem; margin: 1rem 0;
+  }
+  .card strong { display: block; margin-bottom: .25rem; }
+  ul { padding-left: 1.25rem; }
+  footer { margin-top: 3rem; font-size: .85rem; color: #86868b; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; }
+</style>
+</head>
+<body>
+<h1>PocketDOS Support</h1>
+<p class="tagline">Help for the PocketDOS retro PC emulator for iPhone.</p>
+
+<h2>Contact us</h2>
+<div class="card">
+  <strong>&#128231; Email</strong>
+  <a href="mailto:pocketdos@pm.me">pocketdos@pm.me</a><br>
+  Questions, bug reports, or help getting a game running — email us directly.
+  We read every message; replies usually within a few days.
+</div>
+<div class="card">
+  <strong>&#128027; GitHub Issues</strong>
+  <a href="https://github.com/Mantene/PocketDos/issues">github.com/Mantene/PocketDos/issues</a><br>
+  If you have a GitHub account, you can also report bugs publicly. Please don't
+  include personal information.
+</div>
+
+<h2>Reporting a bug</h2>
+<p>Please include:</p>
+<ul>
+  <li>Your iPhone model and iOS version</li>
+  <li>What you were doing (importing a game, playing, running the Windows&nbsp;98 install wizard, &hellip;)</li>
+  <li>What you expected, and what happened instead</li>
+  <li>For game problems: the game's format (<code>.jsdos</code> or <code>.zip</code>) and, if you know it, which DOS setup it needs (sound card, memory)</li>
+</ul>
+
+<h2>Windows 98 install wizard (Experimental)</h2>
+<p>A full install runs unattended for roughly 30&ndash;60 minutes, and the feature is
+young &mdash; that's why it's labeled <em>Experimental</em>. If an install fails, it fails
+cleanly: nothing is lost and you can simply try again. When reporting a wizard
+problem, mention roughly how far it got (the stage text on the progress screen).</p>
+<p>PocketDOS ships no Microsoft software. The wizard requires your own Windows&nbsp;98&nbsp;SE
+CD image and your own product key; both are processed entirely on your device and
+never leave it.</p>
+
+<h2>Frequently asked</h2>
+<p><strong>Where are my games stored?</strong><br>
+In the Files app under <em>On My iPhone &rarr; PocketDOS &rarr; Games</em>. You can back them
+up, add to them, or remove them from there directly.</p>
+<p><strong>Does PocketDOS collect any data?</strong><br>
+No. There's no telemetry, no analytics, no account, and the emulator can't reach
+the network. See the <a href="https://github.com/Mantene/PocketDos/blob/main/PRIVACY.md">privacy policy</a>.</p>
+<p><strong>Can I get my saves onto a new phone?</strong><br>
+Small save files sync automatically through your own iCloud Drive if iCloud is
+enabled. Game files themselves can be copied via the Files app.</p>
+<p><strong>Purchase or App Store problems?</strong><br>
+Use Apple's <a href="https://reportaproblem.apple.com">Report a Problem</a>.</p>
+
+<h2>More</h2>
+<ul>
+  <li><a href="https://github.com/Mantene/PocketDos">Source code</a> — PocketDOS is free software (GPL-2.0)</li>
+  <li><a href="https://github.com/Mantene/PocketDos/blob/main/PRIVACY.md">Privacy policy</a></li>
+  <li><a href="https://github.com/Mantene/PocketDos/blob/main/THIRD_PARTY.md">Third-party licenses</a></li>
+</ul>
+
+<footer>PocketDOS is maintained in spare time &mdash; every report is read.
+&copy; 2026 Mantene &middot; free software, GPL-2.0.</footer>
+</body>
+</html>

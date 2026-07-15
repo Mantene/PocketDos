@@ -2,9 +2,15 @@
 
 Thanks for using PocketDOS! Here's how to get help.
 
+**Support website: <https://mantene.github.io/PocketDos/>**
+
 ## Report a bug or ask a question
 
-The best channel is **[GitHub Issues](https://github.com/Mantene/PocketDos/issues)** —
+**Email us directly: <pocketdos@pm.me>** — questions, bug reports, or help getting
+a game running. We read every message; replies usually within a few days.
+
+If you have a GitHub account, you can also use
+**[GitHub Issues](https://github.com/Mantene/PocketDos/issues)** —
 open a new issue and include:
 
 - Your iPhone model and iOS version
