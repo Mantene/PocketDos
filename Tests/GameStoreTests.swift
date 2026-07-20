@@ -97,6 +97,38 @@ final class GameStoreTests: XCTestCase {
         XCTAssertEqual(g.executables, ["DOOM/DOOM.EXE", "SETUP.COM"], "only .exe/.com/.bat, sorted")
     }
 
+    // MARK: - importGame rejects non-bundle files (regression: silent BOOM.EXE orphan)
+
+    func testImportRejectsBareExecutable() throws {
+        let src = tempRoot.appendingPathComponent("BOOM.EXE")
+        try Data("MZ fake dos executable".utf8).write(to: src)
+        XCTAssertThrowsError(try store.importGame(from: src)) { error in
+            let msg = (error as? LocalizedError)?.errorDescription ?? ""
+            XCTAssertTrue(msg.contains(".zip"), "error must tell the user to import the zip itself")
+        }
+        XCTAssertTrue(store.games.isEmpty)
+        XCTAssertTrue(store.orphanedInstalls.isEmpty,
+                      "a rejected import must not leave an orphaned folder behind")
+    }
+
+    func testImportRejectsUnsupportedExtension() throws {
+        let src = tempRoot.appendingPathComponent("DOOM2.WAD")
+        try Data("IWAD".utf8).write(to: src)
+        XCTAssertThrowsError(try store.importGame(from: src))
+        XCTAssertTrue(store.games.isEmpty)
+        XCTAssertTrue(store.orphanedInstalls.isEmpty)
+    }
+
+    func testImportAcceptsExtensionlessFileAsJsdos() throws {
+        // Untyped .jsdos downloads can arrive with no extension; the importer treats
+        // those as jsdos bundles (the reason importTypes carries the .data fallback).
+        let src = tempRoot.appendingPathComponent("mygame")
+        try makeZip(at: src, entries: [(".jsdos/dosbox.conf", Data("[dosbox]\n".utf8))])
+        try store.importGame(from: src)
+        XCTAssertEqual(store.games.count, 1)
+        XCTAssertEqual(store.games.first?.bundleFileName, "game.jsdos")
+    }
+
     // MARK: - sockdrive import (chunked raw HDD zip)
 
     func testImportSockdriveZipCreatesBundlelessGame() throws {

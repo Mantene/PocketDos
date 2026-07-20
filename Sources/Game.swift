@@ -445,17 +445,39 @@ final class GameStore: ObservableObject {
         return game
     }
 
+    enum ImportError: Error, LocalizedError, Equatable {
+        /// The picked file can never load as a game (loadGame only recognizes
+        /// .zip/.jsdos bundles). Without this guard the importer would copy the
+        /// file anyway and silently produce an orphaned folder — the trap App
+        /// Review hit after the Files app auto-unzipped the sample and they
+        /// picked BOOM.EXE from inside it.
+        case notAGameBundle(String)
+        var errorDescription: String? {
+            switch self {
+            case .notAGameBundle(let name):
+                return "\"\(name)\" isn't a game bundle. Import the whole game as a "
+                    + ".zip or .jsdos file — if the Files app unzipped it, import the "
+                    + "original .zip itself, not the files inside it."
+            }
+        }
+    }
+
     /// Copies a picked file into a fresh library folder.
     func importGame(from sourceURL: URL) throws {
         let fm = FileManager.default
         let scoped = sourceURL.startAccessingSecurityScopedResource()
         defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
 
+        // The picker's .data fallback (needed for untyped .jsdos downloads) lets
+        // ANY file through — reject non-bundles before touching the library dir.
+        let ext = sourceURL.pathExtension.isEmpty ? "jsdos" : sourceURL.pathExtension
+        guard ["zip", "jsdos"].contains(ext.lowercased()) else {
+            throw ImportError.notAGameBundle(sourceURL.lastPathComponent)
+        }
+
         let id = UUID().uuidString
         let dir = gamesURL.appendingPathComponent(id, isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-
-        let ext = sourceURL.pathExtension.isEmpty ? "jsdos" : sourceURL.pathExtension
 
         // A sockdrive zip is a chunked raw HDD, not a bundle. Unpack its chunks into
         // `<dir>/drive/` and register a bundle-less game (identity = SHA256 of metaj).
